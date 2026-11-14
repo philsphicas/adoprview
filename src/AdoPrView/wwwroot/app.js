@@ -29,6 +29,8 @@ function onHostMessage(m) {
     toast(m.data.text, m.data.kind);
   } else if (m.event === 'copilotRun') {
     try { updateCopilotRun(m.data); } catch (e) { toast(e.message || String(e), 'error'); }
+  } else if (m.event === 'explanation') {
+    try { updateExplanation(m.data); } catch (e) { toast(e.message || String(e), 'error'); }
   }
 }
 
@@ -47,6 +49,7 @@ const S = {
   showTs: new Set(),
   busy: new Set(),          // "key:action"
   approvals: new Map(),    // key -> last approval provider outcome (never a credential)
+  reviewVotes: new Map(),
   autoCompleteErrors: new Map(),
   lastSig: '',
   pendingSnapshot: null,
@@ -60,6 +63,7 @@ const S = {
   approvalSettings: null,
   approvalSettingsBusy: false,
   runs: new Map(),
+  explanations: new Map(),
   rowMenu: null,
   drawer: false,
   discovered: null,
@@ -149,12 +153,18 @@ const findPr = (key) => S.snap.prs.find((p) => p.key === key);
 // --------------------------------------------------------------- filtering
 function hiddenSet() { return new Set((S.settings?.hidden || []).map((h) => h.toLowerCase())); }
 
+function ignoredDraft(p) {
+  const fresh = S.pendingSnapshot?.prs.find(pr => pr.key === p.key) || p;
+  return !!(fresh.isIgnoredDraft || (S.settings?.ignoreDrafts && fresh.isDraft));
+}
+
 function baseVisible() {
   const hidden = hiddenSet();
   const q = S.q.trim().toLowerCase();
   return S.snap.prs.filter((p) => {
     // Settings can undo a hide before a refreshed snapshot clears its old flag.
     if (hidden.has(p.key.toLowerCase())) return false;
+    if (S.scope === 'drafts' ? !ignoredDraft(p) : ignoredDraft(p)) return false;
     if (S.scope === 'mine' && !p.isMine) return false;
     if (S.scope === 'watched' && p.isMine) return false;
     if (S.repo && p.repo !== S.repo) return false;
@@ -186,6 +196,11 @@ function setSnapshot(snap) {
     Object.keys(LANES).indexOf(a.lane) - Object.keys(LANES).indexOf(b.lane) ||
     (Date.parse(b.updated) || 0) - (Date.parse(a.updated) || 0));
   const byKey = new Map(snap.prs.map(p => [p.key, p]));
+  for (const [key, outcome] of S.reviewVotes) {
+    if (outcome.kind === 'confirmed' && (byKey.get(key)?.reviewVote?.vote !== 10 ||
+        JSON.stringify(byKey.get(key)?.reviewVote?.target) !== JSON.stringify(findPr(key)?.reviewVote?.target)))
+      S.reviewVotes.delete(key);
+  }
   const oldKeys = new Set(S.rowOrder);
   const order = S.orderRevision === null || revision !== S.orderRevision
     ? sorted.map(p => p.key)
@@ -206,6 +221,7 @@ function setSnapshot(snap) {
       });
       for (const pr of S.snap.prs) syncAutoCompleteButtons(pr.key);
     }
+    for (const pr of S.snap.prs) syncReviewVoteControls(pr.key);
     renderStatus();
     return;
   }
@@ -222,9 +238,12 @@ function setSnapshot(snap) {
 function render() { renderHeader(); renderRows(); if (S.drawer) renderDrawer(); }
 
 function renderHeader() {
+  if (!S.settings?.ignoreDrafts && S.scope === 'drafts') S.scope = 'all';
   const vis = baseVisible();
+  $('#draftFilter').hidden = !S.settings?.ignoreDrafts;
+  document.querySelectorAll('#scope button').forEach(b => b.classList.toggle('on', b.dataset.scope === S.scope));
   $('#laneCounters').innerHTML = Object.entries(LANES).map(([k, m]) => {
-    const n = vis.filter((p) => p.lane === k).length;
+    const n = vis.filter((p) => !ignoredDraft(p) && p.lane === k).length;
     return `<button class="lane-btn ${S.lane === k ? 'on' : ''} ${n ? '' : 'zero'} ${n && (k === 'needsHuman' || k === 'blocked') ? 'pulse' : ''}" data-lane="${k}" style="--c:${m.c}">
       <span class="bar"></span><span class="n">${n}</span><span class="l"><b>${m.label}</b><span>${m.short}</span></span></button>`;
   }).join('');
@@ -282,7 +301,7 @@ function renderRows(whenIdle = false) {
     empty.innerHTML = `<div class="big">📂</div><h2>No repositories yet</h2><div>Add an Azure DevOps repository URL in settings.</div><button class="btn primary" data-act="settings">Open settings</button>`;
     return;
   }
-  const shown = S.lane ? vis.filter((p) => p.lane === S.lane || S.laneRetained.has(p.key)) : vis;
+  const shown = S.lane ? vis.filter((p) => !ignoredDraft(p) && (p.lane === S.lane || S.laneRetained.has(p.key))) : vis;
   if (S.lane) shown.forEach(p => S.laneRetained.add(p.key));
   if (!shown.length) {
     rows.innerHTML = '';
@@ -291,7 +310,9 @@ function renderRows(whenIdle = false) {
     return;
   }
   empty.hidden = true;
-  const html = shown.map(p => renderPr(p, LANES[p.lane]));
+  const html = shown.map(p => renderPr(p, ignoredDraft(p)
+    ? { label: 'Ignored draft', hint: 'Not monitored until published or Ignore draft PRs is turned off', c: 'var(--muted)' }
+    : LANES[p.lane]));
   const scroller = $('main');
   const top = scroller.scrollTop;
   const logScroll = {};
@@ -309,6 +330,78 @@ const runCancelable = r => runActive(r) || (r?.status === 'needs-attention' && r
 const runsForPr = key => [...S.runs.values()].reverse().filter(r => r.key === key)
   .sort((a, b) => (Date.parse(b.startedAt) || 0) - (Date.parse(a.startedAt) || 0));
 const runForPr = key => runsForPr(key).at(0);
+
+const explanationActive = r => !!r && ['preparing', 'running', 'cancelling'].includes(r.status);
+function explanationRevision(r) {
+  const v = r?.revision;
+  return v ? `Iteration ${v.iteration} · source ${v.sourceCommit.slice(0, 12)} · merge base ${v.baseCommit.slice(0, 12)}` : '';
+}
+
+function explanationBody(r) {
+  if (!r?.output) return '';
+  if (r.status !== 'completed') return `<pre class="explain-stream">${esc(r.output)}</pre>`;
+  const html = window.marked ? marked.parse(r.output, { gfm: true, breaks: true }) : esc(r.output);
+  // Model output cannot load remote media, navigate links or inject interactive controls.
+  return window.DOMPurify ? DOMPurify.sanitize(html, {
+    ALLOWED_TAGS: ['p', 'br', 'strong', 'em', 'ul', 'ol', 'li', 'code', 'pre', 'h1', 'h2', 'h3', 'h4',
+      'table', 'thead', 'tbody', 'tr', 'th', 'td', 'blockquote', 'hr', 'del'],
+    ALLOWED_ATTR: [],
+  }) : esc(r.output);
+}
+
+function renderExplanation(key) {
+  const r = S.explanations.get(key), active = explanationActive(r);
+  return `<div class="card explanation" data-explain-key="${esc(key)}">
+    <h3><span class="grow">What does this PR do?</span>
+      <button class="mini" data-act="explainPr" ${active || isBusy(key, 'explainPr') || ignoredDraft(findPr(key) || {}) ? 'disabled' : ''}>${svg('spark')} ${r ? 'Explain again' : 'Explain this PR'}</button>
+      <button class="mini" data-act="cancelExplanation" data-request-id="${esc(r?.requestId || '')}" ${active ? '' : 'hidden'} ${r?.status === 'cancelling' ? 'disabled' : ''}>${svg('x')} Cancel</button></h3>
+    <div class="body">
+      <p class="explain-status small${r?.status === 'failed' ? ' error' : ''}" role="status" aria-live="polite">${esc(r?.message || 'A brief summary of what changes and where it fits in this repository.')}</p>
+      <div class="explain-output md" tabindex="0" aria-label="PR explanation" ${r?.output ? '' : 'hidden'}>${explanationBody(r)}</div>
+      <details class="explain-details">
+        <summary>Evidence and coverage<span class="explain-notices">${r?.coverage?.length ? ` · ${r.coverage.length} notices` : ''}</span></summary>
+        <p class="small">AI-generated; verify important details against the code. Read-only Copilot context; this does not start Fix PR or change ADO.</p>
+        <p class="explain-revision small">${esc(explanationRevision(r))}</p>
+        <div class="explain-evidence small">${(r?.evidence || []).map(x => `<p>${esc(x)}</p>`).join('')}</div>
+        <div class="explain-coverage small">${(r?.coverage || []).map(x => `<p>${esc(x)}</p>`).join('')}</div>
+      </details>
+    </div></div>`;
+}
+
+function updateExplanation(r) {
+  if (!r || typeof r.key !== 'string' || typeof r.requestId !== 'string' || !Number.isSafeInteger(r.sequence) ||
+      !['preparing', 'running', 'cancelling', 'completed', 'cancelled', 'failed'].includes(r.status) ||
+      typeof r.output !== 'string' || !Array.isArray(r.coverage))
+    throw new Error('Copilot returned an invalid explanation state.');
+  const old = S.explanations.get(r.key);
+  if (old && r.sequence <= old.sequence) return;
+  S.explanations.set(r.key, r);
+  // Streaming only mutates this panel, preserving neighboring action targets and focus.
+  for (const card of document.querySelectorAll('.explanation')) {
+    if (card.dataset.explainKey !== r.key) continue;
+    const active = explanationActive(r);
+    const status = $('.explain-status', card);
+    status.textContent = r.message;
+    status.classList.toggle('error', r.status === 'failed');
+    $('.explain-revision', card).textContent = explanationRevision(r);
+    const output = $('.explain-output', card);
+    const bottom = output.scrollHeight - output.clientHeight - output.scrollTop < 30;
+    output.hidden = !r.output;
+    output.innerHTML = explanationBody(r);
+    if (r.status === 'completed' && old?.status !== 'completed') output.scrollTop = 0;
+    else if (bottom) output.scrollTop = output.scrollHeight;
+    $('.explain-coverage', card).innerHTML = r.coverage.map(x => `<p>${esc(x)}</p>`).join('');
+    $('.explain-evidence', card).innerHTML = (r.evidence || []).map(x => `<p>${esc(x)}</p>`).join('');
+    $('.explain-notices', card).textContent = r.coverage.length ? ` · ${r.coverage.length} notices` : '';
+    const start = $('[data-act="explainPr"]', card);
+    start.disabled = active || isBusy(r.key, 'explainPr') || ignoredDraft(findPr(r.key) || {});
+    start.innerHTML = `${svg('spark')} Explain again`;
+    const cancel = $('[data-act="cancelExplanation"]', card);
+    cancel.hidden = !active;
+    cancel.disabled = r.status === 'cancelling';
+    cancel.dataset.requestId = r.requestId;
+  }
+}
 
 function runSummary(r) {
   return `${r.status}${r.exitCode == null ? '' : ` · exit ${r.exitCode}`}: ${r.message || ''}`;
@@ -345,7 +438,7 @@ function renderRunShelf() {
   if (!shelf) return;
   const unfiltered = !S.lane && !S.q.trim() && !S.repo && S.scope === 'all';
   const loaded = !!(S.snap.lastRefresh || S.snap.error);
-  const present = new Set(S.snap.prs.map(p => p.key));
+  const present = new Set(S.snap.prs.filter(p => !ignoredDraft(p)).map(p => p.key));
   // A PR that just left the active list starts collapsed here; later deliberate toggles are kept.
   for (const key of S.activeKeys) if (!present.has(key)) S.expanded.delete(key);
   S.activeKeys = present;
@@ -356,7 +449,7 @@ function renderRunShelf() {
     const r = runForPr(key), open = S.expanded.has(key);
     return `<div class="pr run-only ${open ? 'open' : ''}" data-key="${esc(key)}">
       <div class="run-heading" data-act="toggle">${svg('chev').replace('<svg', '<svg class="chev"')}
-        <div class="prmain"><div class="title">${esc(r.title)}</div><div class="meta small"><span class="id">!${esc(r.id)}</span><span class="sep"> · </span><span>${esc(r.repo)}</span><span class="sep"> · </span><span>PR no longer in the active list · ${esc(runSummary(r))}</span></div></div></div>
+        <div class="prmain"><div class="title">${esc(r.title)}</div><div class="meta small"><span class="id">!${esc(r.id)}</span><span class="sep"> · </span><span>${esc(r.repo)}</span><span class="sep"> · </span><span>${findPr(key) && ignoredDraft(findPr(key)) ? 'Ignored draft' : 'PR no longer in the active list'} · ${esc(runSummary(r))}</span></div></div></div>
       ${open ? `<div class="detail"><div class="full stack">${renderRunCard(key, r)}${earlierRunCards(key)}</div></div>` : ''}
     </div>`;
   }).join('');
@@ -471,6 +564,66 @@ function providerName() { return S.snap.approvalProvider?.name || 'Approval prov
 function approvalTitle(p) { return p.approval?.title || `Request approval via ${providerName()} for only this PR`; }
 function botName() { return S.settings?.reviewBot?.name || 'Review bot'; }
 
+function reviewVoteFor(p) {
+  const state = p.reviewVote;
+  if (!state) return null;
+  const queued = S.pendingSnapshot?.prs.find(pr => pr.key === p.key);
+  if (S.pendingSnapshot && (!queued || queued.error || queued.isActive === false || queued.isHidden ||
+      JSON.stringify(queued.reviewVote?.target) !== JSON.stringify(state.target)))
+    return { ...state, vote: queued?.reviewVote?.vote ?? null, canApprove: false,
+      detail: 'The PR revision or your review state changed. Finish this interaction, then review the refreshed PR before approving.' };
+  if (ignoredDraft(p) || p.isActive === false || p.isHidden || p.error || S.settings?.hidden?.includes(p.key))
+    return { ...state, canApprove: false, detail: 'This PR is inactive, hidden, ignored or could not be refreshed.' };
+  return state;
+}
+
+function reviewVoteTitle(p) {
+  const state = reviewVoteFor(p);
+  return isBusy(p.key, 'approve') ? 'Submitting your ordinary ADO reviewer vote...' : state?.canApprove
+    ? `Approve as ${state.reviewerName}. ADO checks your permissions; other review requirements may remain.`
+    : `${state?.vote === 10 ? `Approved as ${state.reviewerName}.` : 'Approve unavailable.'} ${state?.detail || 'Refresh to identify your ADO reviewer and the PR revision.'}`;
+}
+
+function reviewVoteButton(p, mini = false) {
+  const state = reviewVoteFor(p), busy = isBusy(p.key, 'approve'), title = reviewVoteTitle(p);
+  return `<button class="${mini ? 'mini' : 'act reviewer-vote'} ${busy ? 'busy' : ''} ${state?.vote === 10 ? 'done' : ''}" data-act="approve"
+    title="${esc(title)}" aria-label="${esc(title)}" ${busy || !state?.canApprove ? 'disabled' : ''} ${busy ? 'aria-busy="true"' : ''}>${svg(busy ? 'refresh' : 'check')}<span>${state?.vote === 10 ? 'Approved' : 'Approve'}</span></button>`;
+}
+
+function reviewVoteDescription(p) {
+  const state = reviewVoteFor(p);
+  const labels = { 10: 'Approved', 5: 'Approved with suggestions', 0: 'No vote', '-5': 'Waiting for author', '-10': 'Rejected' };
+  return state ? `<b>${esc(state.reviewerName)}</b> &mdash; your recorded vote: <b>${esc(labels[state.vote] || 'Unknown')}</b>.
+    <p class="small">${esc(state.detail)}</p>` : 'Refresh to identify your ADO reviewer and the PR revision.';
+}
+
+function syncReviewVoteControls(key) {
+  const p = findPr(key);
+  if (!p) return;
+  for (const button of document.querySelectorAll('[data-act="approve"]')) {
+    if (button.closest('.pr')?.dataset.key !== key) continue;
+    const state = reviewVoteFor(p), busy = isBusy(key, 'approve');
+    button.disabled = busy || !state?.canApprove;
+    button.title = reviewVoteTitle(p);
+    button.setAttribute('aria-label', button.title);
+    button.classList.toggle('busy', busy);
+    button.classList.toggle('done', state?.vote === 10);
+    if (busy) button.setAttribute('aria-busy', 'true');
+    else button.removeAttribute('aria-busy');
+    button.innerHTML = svg(busy ? 'refresh' : 'check') + `<span>${state?.vote === 10 ? 'Approved' : 'Approve'}</span>`;
+  }
+  for (const node of document.querySelectorAll('[data-review-vote-state], [data-review-vote-outcome]')) {
+    if (node.closest('.pr')?.dataset.key !== key) continue;
+    if (node.hasAttribute('data-review-vote-state')) node.innerHTML = reviewVoteDescription(p);
+    else {
+      const outcome = S.reviewVotes.get(key);
+      node.textContent = outcome?.message || '';
+      node.hidden = !outcome;
+      node.classList.toggle('error', outcome?.kind === 'error');
+    }
+  }
+}
+
 function actionButtons(p) {
   const out = {};
   const human = p.humanActions || [];
@@ -480,8 +633,13 @@ function actionButtons(p) {
     return `<button class="act ${cls} ${busy ? 'busy' : ''} ${running ? 'running' : ''}" data-act="${act}" title="${esc(title)}" aria-label="${esc(title)}" ${busy ? 'disabled' : ''} ${busy || running ? 'aria-busy="true"' : ''} ${extra}>${svg(busy || running ? 'refresh' : icon)}${label ? `<span>${label}</span>` : ''}</button>`;
   };
 
+  if (ignoredDraft(p)) {
+    out.open = b('open', 'ext', '', '', 'Open in Azure DevOps');
+    return ['approval', 'publish', 'pop', 'auto', 'fix', 'open'].map(slot => `<span class="action-slot" data-slot="${slot}">${out[slot] || ''}</span>`).join('');
+  }
   const needsReview = human.includes('reviews') || p.gates?.reviews?.state === 'human';
   if (p.approval) out.approval = b('generateApproval', 'approval', '', needsReview ? 'provider-approval hot review-needed' : 'provider-approval', approvalTitle(p));
+  else if (p.reviewVote) out.approval = reviewVoteButton(p);
   else if (needsReview) out.approval = b('manualReview', 'approval', '', `${hot} review-needed`, 'Human reviewer approval needed. Open this PR to arrange review.');
   if (human.includes('publish')) out.publish = b('publish', 'send', 'Publish', hot, 'Publish draft (mark ready for review)');
   if (human.includes('pop')) out.pop = b('pop', 'key', 'PoP', hot, 'Proof of Presence — opens the inline Edge pane for your security key');
@@ -514,7 +672,7 @@ function renderPr(p, meta) {
           <div class="meta">${tags.join('')}${metaBits.join('<span class="sep">·</span>')}</div>
         </div>
       </div>
-      ${GATES.map((g) => gateCell(p, g)).join('')}
+      ${GATES.map((g) => gateCell(ignoredDraft(p) ? { gates: {} } : p, g)).join('')}
       <div class="c-upd" title="Updated ${esc(new Date(p.updated).toLocaleString())}\nCreated ${esc(new Date(p.created).toLocaleString())}">${ago(p.updated)}<small>age ${ago(p.created)}</small></div>
       <div class="c-act">${actionButtons(p)}</div>
     </div>
@@ -523,9 +681,15 @@ function renderPr(p, meta) {
 }
 
 function renderDetail(p) {
+  if (ignoredDraft(p)) return `<div class="detail"><div class="full">
+    <p>Ignored draft: no attention notifications or automatic merge checks. Publish it in Azure DevOps or turn off Ignore draft PRs in Settings to resume monitoring.</p>
+    ${S.explanations.has(p.key) ? renderExplanation(p.key) : ''}
+    ${runsForPr(p.key).length ? renderRunCard(p.key) + earlierRunCards(p.key) : ''}
+    </div></div>`;
   const left = [];
   const right = [];
   const full = [];
+  full.push(renderExplanation(p.key));
   full.push(renderRunCard(p.key) + earlierRunCards(p.key));
 
   if (p.approval || S.approvals.has(p.key)) {
@@ -624,11 +788,19 @@ function renderDetail(p) {
       </li>`).join('')}</ul></div></div>`);
   }
 
+  if (p.reviewVote) {
+    const outcome = S.reviewVotes.get(p.key);
+    right.push(`<div class="card"><h3><span class="grow">Your ADO review</span>${reviewVoteButton(p, true)}
+      <button class="mini" data-act="open" title="Open in Azure DevOps">${svg('ext')} Open in ADO</button></h3><div class="body">
+      <div data-review-vote-state>${reviewVoteDescription(p)}</div>
+      <p data-review-vote-outcome role="status" class="${outcome?.kind === 'error' ? 'error' : ''}" ${outcome ? '' : 'hidden'}>${esc(outcome?.message || '')}</p>
+      </div></div>`);
+  }
   const revs = (p.reviewers || []).slice().sort((a, b) => (b.isRequired - a.isRequired) || (a.vote - b.vote));
   if (revs.length) {
     const vl = { 10: 'Approved', 5: 'Approved w/ suggestions', 0: 'No vote', '-5': 'Waiting for author', '-10': 'Rejected' };
     right.push(`<div class="card"><h3>Reviewers <span class="cnt">${revs.length}</span></h3><div class="body"><ul class="list">${revs.map((r) => `
-      <li>${avatar(r.name)}<span class="k">${esc(r.name)} ${r.isRequired ? '<span class="badge req">required</span>' : ''}${r.isContainer ? ' <span class="badge">group</span>' : ''}</span>
+      <li>${avatar(r.name)}<span class="k">${esc(r.name)}${r.id?.toLowerCase() === p.reviewVote?.reviewerId?.toLowerCase() ? ' (you)' : ''} ${r.isRequired ? '<span class="badge req">required</span>' : ''}${r.isContainer ? ' <span class="badge">group</span>' : ''}</span>
       <span class="vote v${r.vote}">${vl[r.vote] ?? r.vote}</span></li>`).join('')}</ul></div></div>`);
   }
 
@@ -721,6 +893,7 @@ async function runAction(key, act, fn, okText) {
   if (isBusy(key, act)) return;
   S.busy.add(`${key}:${act}`);
   if (act === 'autocomplete' || act === 'cancelAuto') syncAutoCompleteButtons(key);
+  else if (act === 'approve') syncReviewVoteControls(key);
   else renderRows();
   try {
     const r = await fn();
@@ -732,6 +905,7 @@ async function runAction(key, act, fn, okText) {
     S.busy.delete(`${key}:${act}`);
     if (act === 'triage') syncCopilotButton(key);
     if (act === 'autocomplete' || act === 'cancelAuto') syncAutoCompleteButtons(key);
+    if (act === 'approve') syncReviewVoteControls(key);
     renderRows(true);
   }
 }
@@ -763,6 +937,8 @@ async function changeAutoComplete(p, enable) {
 
 async function onAction(act, el, key) {
   const p = key ? findPr(key) : null;
+  if (p && ignoredDraft(p) && !['toggle', 'open', 'hide', 'cancelRun', 'cancelExplanation'].includes(act))
+    throw new Error('Draft PRs are ignored. Publish in Azure DevOps or turn off Ignore draft PRs in Settings first.');
   switch (act) {
     case 'toggle':
       if (window.getSelection()?.toString()) return;
@@ -790,6 +966,33 @@ async function onAction(act, el, key) {
     case 'manualReview':
       await rpc('openUrl', { url: p.url });
       break;
+    case 'approve': {
+      const state = p && reviewVoteFor(p);
+      if (!state?.canApprove || !state.target || isBusy(key, act)) return;
+      const expected = { ...state.target };
+      S.reviewVotes.delete(key);
+      await runAction(key, act, async () => {
+        try {
+          const result = await rpc('approve', { key, expected });
+          const updated = result?.pr, target = updated?.reviewVote?.target;
+          if (result?.confirmed !== true || typeof result.message !== 'string' || updated?.key !== key ||
+              updated.id !== p.id || updated.repoId !== p.repoId || updated.org !== p.org || updated.project !== p.project ||
+              updated.reviewVote?.vote !== 10 || target?.vote !== 10 ||
+              Object.keys(expected).some(k => k !== 'vote' && expected[k] !== target[k]) ||
+              !Array.isArray(updated.reviewers) || !Array.isArray(updated.humanActions) || !updated.gates)
+            throw new Error('ADO approval read-back was not confirmed. Refresh and check your recorded vote before retrying.');
+          S.snap = { ...S.snap, prs: S.snap.prs.map(pr => pr.key === key ? updated : pr) };
+          if (S.pendingSnapshot) S.pendingSnapshot = { ...S.pendingSnapshot, prs: S.pendingSnapshot.prs.map(pr =>
+            pr.key === key && JSON.stringify(pr.reviewVote?.target) === JSON.stringify(expected) ? updated : pr) };
+          S.reviewVotes.set(key, { kind: 'confirmed', message: result.message });
+          toast(result.message);
+        } catch (e) {
+          S.reviewVotes.set(key, { kind: 'error', message: e.message || String(e) });
+          throw e;
+        }
+      });
+      break;
+    }
     case 'url':
       await rpc('openUrl', { url: el.dataset.url });
       break;
@@ -839,6 +1042,26 @@ async function onAction(act, el, key) {
         const r = await rpc('startCopilot', { key });
         updateCopilotRun(r);
       });
+      break;
+    case 'explainPr':
+      if (!p || isBusy(key, act) || explanationActive(S.explanations.get(key))) return;
+      S.busy.add(`${key}:${act}`);
+      try { updateExplanation(await rpc('explainPr', { key })); }
+      catch (e) { toast(e.message || String(e), 'error'); }
+      finally {
+        S.busy.delete(`${key}:${act}`);
+        const state = S.explanations.get(key);
+        for (const card of document.querySelectorAll('.explanation')) {
+          if (card.dataset.explainKey === key) $('[data-act="explainPr"]', card).disabled = explanationActive(state);
+        }
+      }
+      break;
+    case 'cancelExplanation':
+      if (!p || isBusy(key, act)) return;
+      S.busy.add(`${key}:${act}`);
+      try { updateExplanation(await rpc('cancelExplanation', { key, requestId: el.dataset.requestId })); }
+      catch (e) { toast(e.message || String(e), 'error'); }
+      finally { S.busy.delete(`${key}:${act}`); }
       break;
     case 'cancelRun':
       await runAction(key, 'cancelRun', async () => updateCopilotRun(await rpc('cancelCopilot', { key, runId: el.dataset.runId })));
@@ -931,9 +1154,12 @@ function renderDrawer() {
     </div>
     <div class="section">
       <h4>Polling</h4>
+      <label class="check"><input type="checkbox" id="ignoreDrafts" ${st.ignoreDrafts ? 'checked' : ''}/> Ignore draft PRs</label>
+      <p class="help">Exclude drafts from attention counts, notifications and automatic merge checks. Find them with the Ignored drafts filter. Publishing resumes monitoring on the next refresh; existing Fix runs are not stopped.</p>
       <div class="field"><label>Refresh every (seconds)</label><input type="number" id="refreshSeconds" min="30" max="3600" value="${st.refreshSeconds}" /></div>
       <div class="field"><label>Merge-conflict re-check every (minutes)</label><input type="number" id="mergeCheckMinutes" min="1" max="240" value="${st.mergeCheckMinutes}" /></div>
-      <label class="check"><input type="checkbox" id="notifications" ${st.notifications ? 'checked' : ''}/> Tray notifications and a distinctive chime for new Needs Human PRs (closing the window keeps it in the tray)</label>
+      <label class="check"><input type="checkbox" id="notifications" ${st.notifications ? 'checked' : ''}/> Tray notifications (closing the window keeps it in the tray)</label>
+      <label class="check"><input type="checkbox" id="sound" ${st.sound ? 'checked' : ''}/> Play chime for new Needs Human PRs</label>
     </div>
     <div class="section">
       <h4>Auto-complete</h4>
@@ -1020,6 +1246,8 @@ async function onDrawerAction(act, el) {
           refreshSeconds: +$('#refreshSeconds').value || 120,
           mergeCheckMinutes: +$('#mergeCheckMinutes').value || 10,
           notifications: $('#notifications').checked,
+          sound: $('#sound').checked,
+          ignoreDrafts: $('#ignoreDrafts').checked,
           autoComplete: { mergeStrategy: $('#mergeStrategy').value, deleteSourceBranch: $('#deleteSourceBranch').checked, transitionWorkItems: $('#transitionWorkItems').checked },
           triageInstructions: $('#triageInstructions').value,
           wslDistro: $('#wslDistro').value.trim(),
@@ -1083,6 +1311,7 @@ function wire() {
   $('#scope').addEventListener('click', (e) => {
     const b = e.target.closest('button[data-scope]');
     if (!b) return;
+    if (b.dataset.scope === 'drafts' || S.scope === 'drafts') S.lane = null;
     S.scope = b.dataset.scope;
     S.laneRetained.clear();
     $('#scope').querySelectorAll('button').forEach((x) => x.classList.toggle('on', x === b));
@@ -1123,6 +1352,7 @@ async function boot() {
   const init = await rpc('init');
   S.settings = init.settings;
   for (const run of init.runs || []) updateCopilotRun(run);
+  for (const explanation of init.explanations || []) updateExplanation(explanation);
   setSnapshot(init.snapshot);
   render();
   window.chrome?.webview?.postMessage('ready');

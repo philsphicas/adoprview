@@ -14,6 +14,7 @@ calls used see [DESIGN.md](DESIGN.md); for building and tests see
 - [Automatic merge re-checks](#automatic-merge-re-checks)
 - [Inline Proof of Presence](#inline-proof-of-presence-compatibility-prototype)
 - [Auto-complete](#auto-complete)
+- [Explain this PR](#explain-this-pr)
 - [Inline Copilot Fix](#inline-copilot-fix)
 - [Restart recovery and worktree cleanup](#restart-recovery-and-worktree-cleanup)
 
@@ -34,9 +35,42 @@ calls used see [DESIGN.md](DESIGN.md); for building and tests see
 - Closing the window keeps it in the tray while notifications are on; exit from the tray menu.
 - A custom four-note chime announces new **Needs Human** arrivals, even while
   the app is focused. Initial load and unchanged rows stay silent; simultaneous
-  arrivals share one chime. The existing Notifications checkbox controls it.
+  arrivals share one chime. Settings has independent **Tray notifications
+  (closing the window keeps it in the tray)** and **Play chime for new Needs Human
+  PRs** checkboxes. Turn the chime off to mute it while keeping tray notifications
+  and background monitoring. Chimes can also stay on with tray notifications off;
+  close-to-tray still depends only on Tray notifications.
+  Existing settings retain their previous sound behavior until you change it.
 - The current refresh interval is shown in the status bar and is configurable
   in Settings (default: 2 minutes; merge re-check: 10 minutes).
+
+### Startup, exit and error logs
+
+Lifecycle diagnostics are written to
+`%LOCALAPPDATA%\AdoPrView\Diagnostics\<session>\events.jsonl`.
+Each session records UTC timestamps, a unique session ID, process ID, version/build,
+window visibility/state, close-to-tray, explicit tray Exit, shutdown teardown,
+Windows session ending and application/process exit. Handled WPF dispatcher errors,
+unobserved task exceptions, terminating unhandled exceptions and dashboard WebView
+process failures have distinct records. Existing error dialogs and exception
+handling behavior are unchanged.
+
+Records are flushed to disk immediately. Each session has at most two 512 KiB log
+files (`events.jsonl` and `events.previous.jsonl`); the ten most recent inactive
+sessions are retained in addition to live instances. Concurrent instances have
+separate locked sessions and are not mistaken for terminated processes.
+An incomplete prior initialization is recorded as `prior-session-unavailable`,
+without inferring an exit or preventing inspection of other sessions.
+The next start reports a prior session without a clean completion record as
+`prior-session-without-clean-end`. This is evidence of an **unclean or unknown
+exit, not proof of a crash**: forced termination, power loss, native failures and
+some OS shutdowns may leave no final exception. Exits before this logging was
+installed cannot be reconstructed from these files.
+
+Exceptions include types, error codes and method-only stack frames, not messages,
+source paths, exception data, credentials, PR/code content or settings. Logging
+failure displays a warning rather than preventing the app from running or claiming
+the evidence was saved.
 
 ## Lanes
 
@@ -90,15 +124,38 @@ requirement and no warnings or waits are invented.
 
 ## Row actions
 
-Row actions use fixed **+1 / Publish / PoP / Auto / Fix / Open** grid slots across
+Row actions use fixed **Review / Publish / PoP / Auto / Fix / Open** grid slots across
 every row. Compact, busy or missing actions keep their slot; enlarged buttons
 cannot displace neighboring actions. Hide has no visible slot.
 
-The **+1** slot is enlarged when the PR needs human reviewer approval,
-including an approval invalidated by later commits, and amber on your own PRs.
-It opens the PR in ADO so you can arrange review. Reviews, PoP and Auto-complete
-do not occupy table columns; their action buttons and expanded status/reviewer
-details retain the underlying requirements.
+**Approve** records the signed-in user's ordinary ADO reviewer vote (`10`).
+Clicking it keeps the row collapsed or expanded as it was.
+One click submits the vote without a confirmation dialog or account selection.
+The app checks the captured PR, signed-in identity, iteration and source/target
+revisions before submitting once, then reads back the vote and
+PR state. **Your ADO review** in expanded details shows your recorded vote and
+keeps **Open in ADO** available. ADO checks permissions; an author's vote may not
+count toward required reviewers. Your approval does not imply other required or
+latest-iteration reviews, policies, merge permission or PoP are satisfied.
+
+An enabled optional approval provider retains its separate **+1** row action;
+ordinary **Approve** remains in expanded details. Without a provider, the row's
+Review slot shows **Approve** directly. Already-approved votes display
+**Approved**, not another write action. If reviewer identity or revision cannot
+be verified, refresh before approving. Ignored, hidden and inactive PRs cannot
+be approved here.
+
+ADO's reviewer-vote API has no atomic revision condition. The app checks both
+sides of the write and reports **Approval not confirmed** if revisions change or
+read-back fails. A vote may have been recorded in that case: refresh and inspect
+the PR before retrying. It never automatically retries or revokes the vote.
+
+In Settings, **Ignore draft PRs** excludes drafts from all attention lanes,
+title/tray/taskbar counts, notifications and automatic merge re-checks. It is
+off by default. The **Ignored drafts** filter lists them without attention
+actions; open a draft in Azure DevOps to publish it, or turn the setting off.
+Publishing restores normal classification on the next refresh. Existing Fix
+runs and their output are retained and are not cancelled by this option.
 
 **Publish** marks a draft ready for review. **Open** opens the PR in Azure
 DevOps. **PoP**, **Auto** and **Fix** are described below.
@@ -167,6 +224,9 @@ the app's dark palette with visible hover, keyboard-focus and disabled states.
 Drag the grip to resize, or focus it and use Up/Down. The pane shows the PR title/ID and current HTTPS
 origin, with Back, Reload, PR page, Check status and Close controls. Website
 sign-in popups stay inside this pane.
+When a website closes its sign-in popup or PoP page, only that popup or pane
+closes; the dashboard stays visible in its existing window state. The dashboard's
+own close button and tray Exit keep their normal behavior.
 
 Complete the normal ADO website's PoP banner yourself, including sign-in,
 security-key or Windows Hello prompts. **Check status**, returning focus from
@@ -198,6 +258,46 @@ It is still a cancel toggle, not disabled; the expanded row also retains
 Pending requests guard both controls, and failures/read-back mismatches show
 explicit feedback rather than a success state. Refresh, collapse and another
 PR selection do not reset the authoritative state or move neighboring rows.
+
+## Explain this PR
+
+Expand a PR and choose **Explain this PR** in **What does this PR do?** Copilot
+reads the actual changes and relevant repository context, then streams a brief
+summary: 1-3 short sentences identifying the component's role, the change and its
+consequence. For example, a dependency update should identify whether its module
+belongs to the product, a developer utility, test infrastructure or a pipeline.
+The model inspects relevant README files, consumers and build context rather than
+inferring benefits from version numbers. **Evidence and coverage** keeps inspected
+paths, revision identifiers and omissions separately, collapsed by default.
+Drafts are supported. This is separate from
+**Fix PR**: it does not start WSL, edit files, approve, publish or update ADO.
+
+Explain uses the native Windows Copilot SDK and its supported default model.
+Sign in with the native Windows Copilot CLI beforehand; the app reuses supported
+Copilot authentication, not your ADO token. Missing sign-in, model/access failures
+and ADO errors appear inline. One explanation runs at a time; **Cancel** stops it.
+Partial or failed responses are labeled and must not be treated as completed.
+Results stay in memory until the app exits; **Explain again** starts a fresh session.
+
+The displayed source and merge-base commits identify the code being explained.
+If the PR changes during the request, the result is marked failed. Copilot sees
+only app-provided read-only tools for that repository and those commits, not a
+shell, arbitrary URLs, local files, installed skills or MCP tools. Repository
+text is sent to Copilot for inference. AI explanations can be wrong; verify
+important details against the code.
+
+Coverage notes report unread changes, binaries, LFS pointers and size limits.
+The prototype inventories at most 1,000 changes, permits 60 file/directory reads, and bounds
+text files to 80,000 characters, diffs to 24,000 characters and context windows to
+120 lines/16,000 characters. Directory listings include at most 200 names.
+If the model initially skips required diff or repository-content inspection, it
+gets one bounded follow-up to gather that evidence, otherwise an explicit error.
+Final summaries are limited to 80 words; an overlong answer gets one bounded
+compression attempt using the SDK's constrained JSON response, then an explicit
+error if it still fails the format.
+It times out after four minutes. Cross-repository
+forks and repository paths containing traversal, backslashes, control characters,
+`?` or `#` are rejected explicitly.
 
 ## Inline Copilot Fix
 
@@ -247,7 +347,13 @@ default) and each repository's source directory. Blank directories try
 `~/clones/<repo>`. The app verifies the directory and its exact Azure DevOps
 organization/project/repository remote before launching. WSL needs Git,
 authenticated Copilot CLI and the managed task runner `bgtask`. The shared
-`~/.config/bash/environment` supplies PATH/BASH_ENV.
+`~/.config/bash/environment` supplies PATH/BASH_ENV. The non-login runner keeps
+existing PATH resolution first, then tries nvm's default and executable
+`~/.local/bin/copilot` if Copilot is still missing. This PATH adjustment is
+inherited by runner children only; no shell configuration is edited.
+`bgtask` also supports the existing `~/go/bin/bgtask` fallback. Preflight errors
+identify the failed dependency or inspection stage and exit code without
+displaying environment values, remote URLs or raw tool errors.
 
 Inline-run compatibility checks advertised CLI option names, not exact help
 sentences. If a required option is absent, the error lists it. Check

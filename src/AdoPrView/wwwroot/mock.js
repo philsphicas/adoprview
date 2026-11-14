@@ -12,6 +12,11 @@
     key: `${repo}-id:${id}`, id, title, url: url(repo, id), org, project, projectId: 'p', repo, repoId: `${repo}-id`,
     sourceBranch: o.branch || `user/sam/${title.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 38)}`, targetBranch: 'main',
     author: o.author || me, isMine: !o.author, isHidden: false, isDraft: !!o.draft,
+    isActive: true,
+    reviewVote: { reviewerId: me.id, reviewerName: me.name, vote: 0, canApprove: true,
+      detail: 'Offline demonstration only. This records no real vote; other reviewers and policies remain unchanged.',
+      target: { reviewerId: me.id, sourceCommit: 'a'.repeat(40), targetCommit: 'b'.repeat(40),
+        sourceRef: `refs/heads/${o.branch || 'sample-change'}`, targetRef: 'refs/heads/main', iterationId: 4, vote: 0 } },
     approval: o.approval === undefined && repo === 'sample-service' ? { title: 'Request approval via the sample provider for only this PR' } : o.approval || null,
     created: iso(o.created || 60 * 30), updated: iso(o.updated || 20), description: o.description || '',
     mergeStatus: o.mergeStatus || 'succeeded', mergeFailure: null, mergeStale: !!o.stale, lastMergeTargetCommit: 'abc',
@@ -132,7 +137,7 @@ Fixes AB#1234`;
     whitelist: ['riley', 'Sample Build Service'],
     reviewBot: { name: 'Review Bot', authorId: '00000000-0000-4000-8000-0000000000b0', organization: org },
     hidden: ['sample-deploy-id:1001'],
-    refreshSeconds: 120, mergeCheckMinutes: 10, notifications: true,
+    refreshSeconds: 120, mergeCheckMinutes: 10, notifications: true, sound: true,
     autoComplete: { mergeStrategy: 'squash', deleteSourceBranch: true, transitionWorkItems: true },
     triageInstructions: null,
     wslDistro: null, wslRepoDirectories: {},
@@ -140,13 +145,40 @@ Fixes AB#1234`;
   const snapshot = { prs, lastRefresh: iso(0.4), refreshing: false, error: null, repoErrors: [], me: 'Sam Example',
     approvalProvider: { name: 'Sample approval', linkUrl: null, linkLabel: null }, approvalProviderError: null };
   const runs = new Map();
+  const explanations = new Map();
+  let explanationSequence = 0;
 
   window.MockHost = {
     onEvent: null,
     async rpc(method, p) {
       await new Promise((r) => setTimeout(r, 150));
       switch (method) {
-        case 'init': return { settings, snapshot, runs: [...runs.values()], version: 'mock' };
+        case 'init': return { settings, snapshot, runs: [...runs.values()], explanations: [...explanations.values()], version: 'mock' };
+        case 'explainPr': {
+          const pr = prs.find(x => x.key === p.key);
+          if (!pr) throw new Error('Mock PR not found.');
+          const state = { key: pr.key, requestId: 'mock-' + (++explanationSequence), sequence: explanationSequence,
+            status: 'running', message: 'UI preview only: no Copilot model or ADO request is running.',
+            output: '', revision: { iteration: 4, sourceCommit: '1111111111111111111111111111111111111111',
+              baseCommit: '2222222222222222222222222222222222222222' }, coverage: [] };
+          explanations.set(p.key, state);
+          setTimeout(() => {
+            if (explanations.get(p.key)?.requestId !== state.requestId || explanations.get(p.key)?.status !== 'running') return;
+            const done = { ...state, sequence: ++explanationSequence, status: 'completed',
+              message: 'Mock explanation: interaction preview only, not a live model result.',
+              output: 'UI preview only. A real summary identifies the affected component, its role in the repository and the meaningful change.',
+              coverage: ['No real PR content was inspected in this mock preview.'] };
+            explanations.set(p.key, done); this.onEvent?.({ event: 'explanation', data: done });
+          }, 1200);
+          return state;
+        }
+        case 'cancelExplanation': {
+          const state = explanations.get(p.key);
+          if (!state || state.requestId !== p.requestId) throw new Error('This mock explanation is no longer current.');
+          const cancelled = { ...state, sequence: ++explanationSequence, status: 'cancelled', message: 'Mock explanation cancelled.' };
+          explanations.set(p.key, cancelled); this.onEvent?.({ event: 'explanation', data: cancelled });
+          return cancelled;
+        }
         case 'logTail': return logText;
         case 'triage': case 'copyPrompt': return { prompt: 'mock' };
         case 'openPop': return { message: `Mock inline PoP for ${p.key}; no browser, sign-in or approval was started. The installed app uses a separate native Edge WebView2 pane.` };
@@ -190,6 +222,14 @@ Fixes AB#1234`;
             message: failed ? 'Mock provider returned HTTP 403; approval is not confirmed.' : 'Mock provider response. This does not confirm a live approval.',
             response: JSON.stringify({ mock: true, pr: `${pr.repo}/${pr.id}` }, null, 2),
           };
+        }
+        case 'approve': {
+          const pr = prs.find(x => x.key === p.key);
+          if (!pr?.reviewVote?.canApprove || JSON.stringify(p.expected) !== JSON.stringify(pr.reviewVote.target))
+            throw new Error('Mock review state changed. Refresh first.');
+          pr.reviewVote = { ...pr.reviewVote, vote: 10, canApprove: false, target: { ...pr.reviewVote.target, vote: 10 } };
+          pr.reviewers = pr.reviewers.filter(r => r.id !== me.id).concat({ ...me, vote: 10, isRequired: false, isContainer: false });
+          return { confirmed: true, alreadyApproved: false, message: 'Mock vote recorded only in this offline demonstration. Other policies remain unchanged.', pr: structuredClone(pr) };
         }
         case 'hide': settings.hidden.push(p.key); return settings;
         case 'unhide': settings.hidden = settings.hidden.filter((h) => h !== p.key); return settings;

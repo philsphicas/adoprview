@@ -320,6 +320,7 @@ those authors and hidden keys. Empty `value: []` is valid; missing/invalid data,
 | `hidden` | String array of `repoId:prId`; preserve |
 | `refreshSeconds` / `mergeCheckMinutes` | Integers; `120` / `10` |
 | `notifications` | Boolean; `true` |
+| `sound` | Boolean; `true` for new settings. Independent chime toggle; older files without it inherit their previous `notifications` value on load |
 | `autoComplete` | `{mergeStrategy:"squash", deleteSourceBranch:true, transitionWorkItems:true}`; options, not an install-time action |
 | `triageInstructions` | Optional custom Fix prompt; preserve verbatim |
 | `wslDistro` | Optional distro name; null/blank uses WSL default |
@@ -380,7 +381,7 @@ try {
     } else {
         $settings = [pscustomobject][ordered]@{
             repos = @(); whitelist = @(); hidden = @()
-            refreshSeconds = 120; mergeCheckMinutes = 10; notifications = $true
+            refreshSeconds = 120; mergeCheckMinutes = 10; notifications = $true; sound = $true
             autoComplete = [pscustomobject]@{
                 mergeStrategy = 'squash'; deleteSourceBranch = $true; transitionWorkItems = $true
             }

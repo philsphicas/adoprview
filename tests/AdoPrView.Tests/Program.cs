@@ -3,6 +3,21 @@ using System.Text;
 using System.Text.Json.Nodes;
 using AdoPrView;
 
+if (args is ["--diagnostics-probe", var diagnosticRoot, var mode])
+{
+    var log = new AppDiagnostics(diagnosticRoot, _ => Environment.Exit(9));
+    log.RegisterProcessHandlers();
+    if (mode == "early-exit") Environment.Exit(7);
+    if (mode == "unobserved")
+    {
+        AppDiagnosticsTests.CreateUnobservedTask();
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+    }
+    log.Complete("probe-returned");
+    return;
+}
+
 const string BotId = "00000000-0000-4000-8000-0000000000b0";
 var bot = new ReviewBotSettings { Name = "Review bot", AuthorId = BotId };
 var tests = 0;
@@ -349,6 +364,45 @@ await Test("hidden and error rows do not create arrival notifications", () =>
     return Task.CompletedTask;
 });
 
+foreach (var notifications in new[] { false, true })
+foreach (var sound in new[] { false, true })
+await Test($"chime and close-to-tray are independent: notifications={notifications}, sound={sound}", () =>
+{
+    var settings = new AppSettings { Notifications = notifications, Sound = sound };
+    var human = Pr(); human.Lane = Lane.NeedsHuman;
+    var pending = new Dictionary<string, Lane> { [human.Key] = human.Lane };
+    var delivery = MainWindow.DrainNotices([human], pending, settings, headlessCapture: false);
+    Check(delivery.PlayHumanSound == sound && delivery.Notices.Length == 1 && pending.Count == 0,
+        "Tray notifications changed chime eligibility or consumed the notice incorrectly");
+    Check(MainWindow.ShouldKeepInTray(settings, false, false, System.Windows.WindowState.Normal) == notifications &&
+        MainWindow.ShouldKeepInTray(settings, false, false, System.Windows.WindowState.Maximized) == notifications,
+        "Sound changed normal close-to-tray behavior");
+    Check(!MainWindow.ShouldKeepInTray(settings, true, false, System.Windows.WindowState.Normal) &&
+        !MainWindow.ShouldKeepInTray(settings, false, true, System.Windows.WindowState.Normal) &&
+        !MainWindow.ShouldKeepInTray(settings, false, false, System.Windows.WindowState.Minimized),
+        "Explicit exit, headless or minimized-close behavior changed");
+    pending[human.Key] = human.Lane;
+    Check(!MainWindow.DrainNotices([human], pending, settings, headlessCapture: true).PlayHumanSound, "Headless capture would play sound");
+    return Task.CompletedTask;
+});
+
+await Test("queued human arrivals use the current mute setting at delivery without replaying on unmute", () =>
+{
+    var human = Pr(); human.Lane = Lane.NeedsHuman;
+    var settings = new AppSettings { Notifications = true, Sound = true };
+    var pending = new Dictionary<string, Lane> { [human.Key] = human.Lane };
+    settings.Sound = false;
+    var delivery = MainWindow.DrainNotices([human], pending, settings, headlessCapture: false);
+    Check(!delivery.PlayHumanSound && delivery.Notices.Length == 1 && settings.Notifications, "Queued mute suppressed the tray notice or played sound");
+    settings.Sound = true;
+    Check(!MainWindow.DrainNotices([human], pending, settings, headlessCapture: false).PlayHumanSound, "Unmute replayed a consumed arrival");
+    human.Lane = Lane.Blocked; pending[human.Key] = human.Lane;
+    Check(!MainWindow.DrainNotices([human], pending, settings, headlessCapture: false).PlayHumanSound, "Blocked arrival played the human chime");
+    pending[human.Key] = Lane.NeedsHuman;
+    Check(MainWindow.DrainNotices([human], pending, settings, headlessCapture: false).Notices.Length == 0, "Stale queued lane produced a notification");
+    return Task.CompletedTask;
+});
+
 await Test("custom chime is an original, non-clipping mono PCM wave under one second", () =>
 {
     var wave = HumanAttentionSound.CreateWave();
@@ -376,9 +430,13 @@ await ReviewBotScopeTests.Run(Test);
 await BuildCacheScopeTests.Run(Test);
 await CopilotSourceTests.Run(Test);
 await CopilotRunTests.Run(Test);
+await CopilotPreflightTests.Run(Test);
 await CopilotRecoveryTests.Run(Test);
 await PopPaneTests.Run(Test);
 await AutoCompleteTests.Run(Test);
+await ReviewerVoteTests.Run(Test);
+await AppDiagnosticsTests.Run(Test);
+await ExplainTests.Run(Test);
 
 Console.WriteLine($"{tests} offline tests passed. No live HTTP or approval requests were made.");
 

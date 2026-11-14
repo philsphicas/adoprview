@@ -10,7 +10,7 @@ namespace AdoPrView;
 /// JSON-RPC bridge between the WebView2 UI and the services.
 public sealed class Bridge(PrService prs, SettingsStore store, Func<string, Task> post, Action<bool> kickRefresh,
     IApprovalProvider? approval = null, IApprovalUi? approvalUi = null, Func<string, JsonObject, Task<object>>? copilotAction = null,
-    Func<string, Task<object>>? popAction = null)
+    Func<string, Task<object>>? popAction = null, Func<string, JsonObject, Task<object>>? explainAction = null)
 {
     public static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web)
     {
@@ -22,6 +22,7 @@ public sealed class Bridge(PrService prs, SettingsStore store, Func<string, Task
     public Task PushSettingsAsync() => post(JsonSerializer.Serialize(new { @event = "settings", data = store.Current }, Json));
     public Task PushToastAsync(string kind, string text) => post(JsonSerializer.Serialize(new { @event = "toast", data = new { kind, text } }, Json));
     public Task PushCopilotRunAsync(object run) => post(JsonSerializer.Serialize(new { @event = "copilotRun", data = run }, Json));
+    public Task PushExplanationAsync(object state) => post(JsonSerializer.Serialize(new { @event = "explanation", data = state }, Json));
 
     public async Task HandleAsync(string message)
     {
@@ -52,6 +53,7 @@ public sealed class Bridge(PrService prs, SettingsStore store, Func<string, Task
             case "init":
                 return new { settings = store.Current, snapshot = prs.Current,
                     runs = copilotAction is null ? Array.Empty<object>() : await copilotAction("listCopilot", p),
+                    explanations = explainAction is null ? Array.Empty<object>() : await explainAction("listExplanations", p),
                     version = typeof(Bridge).Assembly.GetName().Version?.ToString(3) };
             case "refresh":
                 kickRefresh(true);
@@ -69,6 +71,10 @@ public sealed class Bridge(PrService prs, SettingsStore store, Func<string, Task
                 return null;
             case "generateApproval":
                 return await prs.RequestApprovalAsync(Str(p, "key"), Ui());
+            case "approve":
+                var expectedVote = p["expected"]?.Deserialize<ReviewVoteTarget>(Json)
+                    ?? throw new ArgumentException("Missing captured review revision. Refresh before approving.");
+                return await prs.ApproveAsync(Str(p, "key"), expectedVote);
             case "approvalSettings":
                 return Provider().GetSettings();
             case "approvalSettingsAction":
@@ -100,6 +106,10 @@ public sealed class Bridge(PrService prs, SettingsStore store, Func<string, Task
             case "cancelCopilot":
                 if (copilotAction is null) throw new InvalidOperationException("The native inline Copilot runner is unavailable.");
                 return await copilotAction(method, p);
+            case "explainPr":
+            case "cancelExplanation":
+                if (explainAction is null) throw new InvalidOperationException("The native PR explanation service is unavailable.");
+                return await explainAction(method, p);
             case "hide":
             case "unhide":
                 var key = Str(p, "key");
@@ -140,6 +150,9 @@ public sealed class Bridge(PrService prs, SettingsStore store, Func<string, Task
                     s.RefreshSeconds = Math.Clamp(incoming.RefreshSeconds, 30, 3600);
                     s.MergeCheckMinutes = Math.Clamp(incoming.MergeCheckMinutes, 1, 240);
                     s.Notifications = incoming.Notifications;
+                    if (p["settings"]!.AsObject().Any(field => field.Key.Equals("sound", StringComparison.OrdinalIgnoreCase)))
+                        s.Sound = incoming.Sound;
+                    s.IgnoreDrafts = incoming.IgnoreDrafts;
                     // Update known fields in place so fields from other versions survive.
                     var autoComplete = s.AutoComplete ??= new();
                     if (incoming.AutoComplete is { } ac)
@@ -153,6 +166,7 @@ public sealed class Bridge(PrService prs, SettingsStore store, Func<string, Task
                     s.WslRepoDirectories = (incoming.WslRepoDirectories ?? new()).Where(kv => !string.IsNullOrWhiteSpace(kv.Value))
                         .ToDictionary(kv => kv.Key.ToLowerInvariant(), kv => kv.Value.Trim(), StringComparer.OrdinalIgnoreCase);
                 });
+                prs.ApplyMonitoringSettings();
                 kickRefresh(false);
                 return store.Current;
             default:

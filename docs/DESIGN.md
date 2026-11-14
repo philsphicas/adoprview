@@ -23,8 +23,9 @@ enough detail inline that you rarely need to click into ADO.
   bar, tray icon with balloon notifications when a PR newly needs human action or
   becomes blocked. A bespoke four-note chime plays once per update when one or
   more PRs enter Needs Human, even in the foreground. Initial load, unchanged
-  rows, hidden/error rows, disabled notifications and headless captures are
-  silent. Full refresh and single-PR refresh share transition detection.
+  rows, hidden/error rows, disabled chimes and headless captures are
+  silent. Chime playback is independent of tray notifications; close-to-tray
+  still follows tray notifications. Full refresh and single-PR refresh share transition detection.
 * **UI:** plain HTML/CSS/JS (no build step) served from a WebView2 virtual host.
   `marked` + `DOMPurify` are vendored for safe Markdown descriptions.
   `?mock=1` runs the UI in any browser against fixture data for fast iteration.
@@ -41,6 +42,27 @@ enough detail inline that you rarely need to click into ADO.
   approval provider is loaded. A provider is trusted native .NET code that the
   core loads only from an explicitly configured local assembly; it is not a
   sandbox or plugin marketplace. See [Approval provider contract](#approval-provider-contract).
+* **Explain:** `Bridge -> ExplainService -> ExplainContext / ExplainModel`.
+  The service captures repository/PR identity and the latest iteration's source
+  and common-base commits, pages changes with `$compareTo=0`, and supplies bounded
+  diffs, file windows and directory listings through four host-owned read-only
+  tools. The model must inspect context beyond the diff to establish the affected
+  component's role in the repository. The final summary is limited to 1-3 sentences
+  and 80 words, with at most one compression attempt; host-recorded evidence and
+  omissions stay behind a separate disclosure. Final verification
+  rejects changed iterations, refs, commits or failed context reads. `ExplainModel`
+  lazily owns a native Windows SDK runtime under `AdoPrView\Explain\runtime`,
+  uses a fresh session per request, and verifies the effective tool catalog
+  exactly matches its allowlist before sending PR data. Configuration discovery,
+  instructions, skills, hooks, host Git operations, memory and session storage
+  are disabled; all permission requests are rejected. The child environment
+  excludes token overrides and ADO credentials. Copilot authentication uses the
+  SDK's logged-in-user mechanism. Stream events carry PR/request identity and a
+  monotonic sequence; only the explanation panel updates. Completed Markdown
+  permits no attributes, links, media or interactive controls. Shutdown cancels
+  and awaits work before disposing the runtime. See [usage](usage.md#explain-this-pr)
+  for bounds and [development](development.md#isolated-real-model-explain-demonstration)
+  for the isolated real-model fixture demo.
 
 ## Approval provider contract
 
@@ -301,7 +323,11 @@ older snapshot's hidden flag, determine row visibility after a restore.
 * Inline PoP prototype: a native resizable pane below the dashboard owns a
   separate WebView2 environment/profile (`PoPWebView2`), with Windows
   primary-account SSO enabled. HTTPS sign-in popups use additional unprivileged
-  WebView2 controls in the same pane/environment. There is no dashboard message
+  WebView2 controls in the same pane/environment. They use WinForms WebView2 inside WPF
+  `WindowsFormsHost`: the WPF WebView2 control's built-in website-close handler
+  closes its containing WPF Window. The PoP host instead defers website close
+  callbacks and closes only the still-current popup/pane; it records fixed-label
+  lifecycle breadcrumbs without URLs or PR/auth data. There is no dashboard message
   dispatcher, host object or `app.local` mapping on any website surface; web
   messages/host objects are disabled and dashboard RPC also verifies its source.
   Origin display omits URL paths/query/fragment. Local/non-HTTPS navigation,

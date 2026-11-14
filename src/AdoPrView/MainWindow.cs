@@ -21,27 +21,32 @@ public sealed class MainWindow : Window, IApprovalUi
     readonly PopBrowserPane _pop;
     readonly IApprovalProvider? _approval;
     readonly CopilotRunService _copilot = new();
+    readonly ExplainService _explain;
     readonly ConcurrentDictionary<string, byte> _copilotStarting = new(StringComparer.OrdinalIgnoreCase);
     readonly Options _opts;
+    readonly AppDiagnostics _diagnostics;
     readonly System.Windows.Forms.NotifyIcon _tray;
     readonly HumanAttentionSound _attentionSound = new();
-    readonly List<string> _pendingNotices = new();
-    bool _pendingHumanSound;
+    readonly Dictionary<string, Lane> _pendingNotices = new(StringComparer.OrdinalIgnoreCase);
     Bridge? _bridge;
     CancellationTokenSource _wake = new();
     bool _uiReady;
     bool _quitting;
     bool _shutdownComplete;
     bool _shutdownInProgress;
+    string _shutdownReason = "window-close";
     int _reorderRequested;
 
-    public MainWindow(Options opts)
+    internal MainWindow(Options opts, AppDiagnostics diagnostics)
     {
         _opts = opts;
+        _diagnostics = diagnostics;
         _store = new SettingsStore();
         (_approval, var approvalError) = ApprovalProviderLoader.Load(_store.Current.ApprovalProvider);
         _prs = new PrService(new AdoClient(), _store, _approval, approvalError);
+        _explain = new ExplainService(_prs.GetExplainContextAsync);
         _pop = new PopBrowserPane(_prs.RefreshPopAsync);
+        _pop.Diagnostic += (kind, reason) => _diagnostics.Record(kind, reason);
 
         Title = "ADO PR View";
         Background = new SolidColorBrush(Color.FromRgb(0x0e, 0x10, 0x14));
@@ -88,20 +93,24 @@ public sealed class MainWindow : Window, IApprovalUi
         var menu = new System.Windows.Forms.ContextMenuStrip();
         menu.Items.Add("Open", null, (_, _) => ShowFromTray());
         menu.Items.Add("Refresh now", null, (_, _) => Kick(reorder: true));
-        menu.Items.Add("Exit", null, (_, _) => { _quitting = true; Close(); });
+        menu.Items.Add("Exit", null, (_, _) => { _shutdownReason = "tray-exit"; _quitting = true; Close(); });
         _tray.ContextMenuStrip = menu;
 
         SourceInitialized += (_, _) => ApplyDarkTitleBar();
         Loaded += async (_, _) => await InitAsync();
+        StateChanged += (_, _) => _diagnostics.Record("window-state", WindowState.ToString());
+        IsVisibleChanged += (_, _) => _diagnostics.Record("window-visibility", IsVisible ? "visible" : "hidden");
         Closing += async (_, e) =>
         {
             if (_shutdownComplete) return;
+            _diagnostics.Record("window-close-requested", _shutdownReason);
             SavePlacement();
-            if (!_quitting && !_opts.HeadlessCapture && WindowState != WindowState.Minimized && _store.Current.Notifications)
+            if (ShouldKeepInTray(_store.Current, _quitting, _opts.HeadlessCapture, WindowState))
             {
                 // Closing the window keeps the poller alive in the tray.
                 e.Cancel = true;
                 Hide();
+                _diagnostics.Record("close-kept-in-tray");
                 _tray.ShowBalloonTip(2500, "ADO PR View is still running", "Watching your PRs from the tray. Right-click the tray icon to exit.", System.Windows.Forms.ToolTipIcon.None);
                 _quitting = false;
                 return;
@@ -109,25 +118,34 @@ public sealed class MainWindow : Window, IApprovalUi
             e.Cancel = true;
             if (_shutdownInProgress) return;
             _shutdownInProgress = true;
+            _diagnostics.Record("shutdown-started", _shutdownReason);
             try
             {
+                await _explain.DisposeAsync();
                 await _copilot.DisposeAsync();
                 _pop.Dispose();
                 _shutdownComplete = true;
                 _tray.Visible = false;
                 _tray.Dispose();
                 _attentionSound.Dispose();
+                _diagnostics.Record("shutdown-teardown-completed", _shutdownReason);
                 _ = Dispatcher.BeginInvoke(new Action(Close));
             }
             catch (Exception ex)
             {
                 _shutdownInProgress = false;
                 _quitting = false;
+                _diagnostics.Record("shutdown-blocked", _shutdownReason, ex);
+                _shutdownReason = "window-close";
                 ShowFromTray();
                 MessageBox.Show(this, "The app cannot exit safely: " + ex.Message, "Copilot task still needs attention", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
         };
-        Closed += (_, _) => Application.Current.Shutdown();
+        Closed += (_, _) =>
+        {
+            _diagnostics.Record("window-closed", _shutdownReason);
+            Application.Current.Shutdown();
+        };
     }
 
     void ShowFromTray()
@@ -148,6 +166,7 @@ public sealed class MainWindow : Window, IApprovalUi
         var env = await CoreWebView2Environment.CreateAsync(null, Path.Combine(SettingsStore.Dir, "WebView2"));
         await _web.EnsureCoreWebView2Async(env);
         var core = _web.CoreWebView2;
+        core.ProcessFailed += (_, e) => _diagnostics.Record("webview-process-failed", e.ProcessFailedKind.ToString());
         _web.DefaultBackgroundColor = System.Drawing.Color.FromArgb(0x0e, 0x10, 0x14);
         core.Settings.AreDevToolsEnabled = true;
         core.Settings.IsStatusBarEnabled = false;
@@ -161,8 +180,9 @@ public sealed class MainWindow : Window, IApprovalUi
                 System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(e.Uri) { UseShellExecute = true });
         };
 
-        _bridge = new Bridge(_prs, _store, PostAsync, Kick, _approval, this, HandleCopilotAsync, HandlePopAsync);
+        _bridge = new Bridge(_prs, _store, PostAsync, Kick, _approval, this, HandleCopilotAsync, HandlePopAsync, HandleExplainAsync);
         _copilot.Changed += run => _ = _bridge.PushCopilotRunAsync(RunForUi(run));
+        _explain.Changed += state => _ = _bridge.PushExplanationAsync(state);
         core.WebMessageReceived += (_, e) =>
         {
             if (!PopTarget.IsDashboardSource(e.Source)) return;
@@ -173,11 +193,10 @@ public sealed class MainWindow : Window, IApprovalUi
         _prs.Changed += s => Dispatcher.InvokeAsync(() => OnSnapshot(s));
         _prs.LaneChanged += (pr, _) =>
         {
-            if (pr.Lane is Lane.NeedsHuman or Lane.Blocked)
+            if (!pr.IsIgnoredDraft && pr.Lane is Lane.NeedsHuman or Lane.Blocked)
                 lock (_pendingNotices)
                 {
-                    _pendingNotices.Add($"{(pr.Lane == Lane.NeedsHuman ? "Needs Human" : "Blocked")}: !{pr.Id} {pr.Title}");
-                    if (pr.Lane == Lane.NeedsHuman) _pendingHumanSound = true;
+                    _pendingNotices[pr.Key] = pr.Lane;
                 }
         };
 
@@ -193,6 +212,16 @@ public sealed class MainWindow : Window, IApprovalUi
         run.WorktreePath, run.WorktreeStatus, run.WorktreeRetained, run.Distro, run.SourceDirectory, run.StartedAt, run.FinishedAt,
         run.SessionId, run.ResumeAttempts, run.LogPath, run.OutputOffset,
     };
+
+    async Task<object> HandleExplainAsync(string action, JsonObject parameters)
+    {
+        if (action == "listExplanations") return _explain.States;
+        var key = parameters["key"]?.GetValue<string>() ?? throw new ArgumentException("Missing PR key.");
+        if (action == "cancelExplanation")
+            return await _explain.CancelAsync(key, parameters["requestId"]?.GetValue<string>() ?? throw new ArgumentException("Missing explanation ID."));
+        _prs.Find(key); // Reject keys that are not in the loaded dashboard before starting work.
+        return _explain.Start(key);
+    }
 
     async Task RecoverCopilotAsync()
     {
@@ -250,8 +279,7 @@ public sealed class MainWindow : Window, IApprovalUi
     void OnSnapshot(Snapshot s)
     {
         _ = _bridge?.PushSnapshotAsync(s);
-        if (s.Refreshing) return;
-        var visible = s.Prs.Where(p => !p.IsHidden).ToList();
+        var visible = s.Prs.Where(p => !p.IsHidden && !p.IsIgnoredDraft).ToList();
         var needs = visible.Count(p => p.Lane == Lane.NeedsHuman);
         var blocked = visible.Count(p => p.Lane == Lane.Blocked);
         Title = needs > 0 ? $"ADO PR View — {needs} need human action" : "ADO PR View";
@@ -259,19 +287,27 @@ public sealed class MainWindow : Window, IApprovalUi
         TaskbarItemInfo.Overlay = needs > 0 ? Badge(needs) : null;
         TaskbarItemInfo.Description = _tray.Text;
 
-        string[] notices;
-        bool playHumanSound;
-        lock (_pendingNotices)
-        {
-            notices = _pendingNotices.ToArray();
-            _pendingNotices.Clear();
-            playHumanSound = _pendingHumanSound;
-            _pendingHumanSound = false;
-        }
-        if (playHumanSound && _store.Current.Notifications && !_opts.HeadlessCapture)
+        if (s.Refreshing) return;
+        var (notices, playHumanSound) = DrainNotices(visible, _pendingNotices, _store.Current, _opts.HeadlessCapture);
+        if (playHumanSound)
             _attentionSound.Play();
         if (notices.Length > 0 && _store.Current.Notifications && !_opts.HeadlessCapture && !IsActive)
             _tray.ShowBalloonTip(6000, notices.Length == 1 ? "PR status changed" : $"{notices.Length} PRs changed", string.Join("\n", notices.Take(4)), System.Windows.Forms.ToolTipIcon.Info);
+    }
+
+    internal static bool ShouldKeepInTray(AppSettings settings, bool quitting, bool headlessCapture, WindowState state) =>
+        !quitting && !headlessCapture && state != WindowState.Minimized && settings.Notifications;
+
+    internal static (string[] Notices, bool PlayHumanSound) DrainNotices(IEnumerable<PrView> visible,
+        Dictionary<string, Lane> pendingNotices, AppSettings settings, bool headlessCapture)
+    {
+        lock (pendingNotices)
+        {
+            var pending = visible.Where(p => pendingNotices.TryGetValue(p.Key, out var lane) && lane == p.Lane).ToList();
+            var notices = pending.Select(p => $"{(p.Lane == Lane.NeedsHuman ? "Needs Human" : "Blocked")}: !{p.Id} {p.Title}").ToArray();
+            pendingNotices.Clear();
+            return (notices, settings.Sound && !headlessCapture && pending.Any(p => p.Lane == Lane.NeedsHuman));
+        }
     }
 
     static ImageSource Badge(int n)
@@ -317,6 +353,7 @@ public sealed class MainWindow : Window, IApprovalUi
         await using (var fs = File.Create(_opts.ScreenshotPath!))
             await _web.CoreWebView2.CapturePreviewAsync(CoreWebView2CapturePreviewImageFormat.Png, fs);
         _quitting = true;
+        _shutdownReason = "capture-completed";
         Close();
     }
 
