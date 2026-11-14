@@ -31,7 +31,7 @@ internal sealed class ExplainService(Func<string, CancellationToken, Task<Explai
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (_operations.TryGetValue(key, out var previous) && Active(previous.State.Status)) return previous.State;
-            // Keep at most one explanation active: a local demo should not spawn unbounded model work.
+            // Share the runtime without allowing concurrent model requests.
             if (_operations.Values.Any(o => Active(o.State.Status)))
                 throw new InvalidOperationException("Another PR explanation is running. Cancel it or wait for it to finish.");
             previous?.Cancel.Dispose();

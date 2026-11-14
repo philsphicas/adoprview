@@ -41,6 +41,7 @@ calls used see [DESIGN.md](DESIGN.md); for building and tests see
   and background monitoring. Chimes can also stay on with tray notifications off;
   close-to-tray still depends only on Tray notifications.
   Existing settings retain their previous sound behavior until you change it.
+  Muted arrivals are consumed without replaying when the chime is turned back on.
 - The current refresh interval is shown in the status bar and is configurable
   in Settings (default: 2 minutes; merge re-check: 10 minutes).
 
@@ -80,9 +81,9 @@ each lane. Click a counter to filter by it.
 - **Needs Human** means only reviewer approval (+1), Proof of Presence,
   auto-complete or publishing a draft remains, in any combination. In practice
   that is two kinds of work, which can appear together on one PR:
-  - **A reviewer's approval is still needed.** The enlarged **+1** button marks
-    the PR. Any approver can provide it, so it applies to watched PRs too;
-    the +1 is amber only on your own PRs.
+  - **A reviewer's approval is still needed.** **Approve** records your own
+    reviewer vote. Other required reviewers may still need to approve, including
+    on watched PRs. An optional provider uses the **+1** button instead.
   - **Your finishing actions:** **PoP** (Proof of Presence), **Auto**
     (set auto-complete) and/or **Publish** (a draft), alone or alongside +1
     when a review is also still needed. These are amber on your own PRs; on
@@ -124,6 +125,14 @@ requirement and no warnings or waits are invented.
 
 ## Row actions
 
+In Settings, **Ignore draft PRs** excludes drafts from all attention lanes,
+title/tray/taskbar counts, notifications and automatic merge re-checks. It is
+off by default. The **Ignored drafts** filter lists them without attention
+actions; open a draft in Azure DevOps to publish it, or turn the setting off.
+Publishing restores normal classification on the next refresh. Existing Fix
+runs and explanations, and their output, are retained and remain cancellable;
+**Explain** is unavailable for ignored drafts until the setting is turned off.
+
 Row actions use fixed **Review / Publish / PoP / Auto / Fix / Open** grid slots across
 every row. Compact, busy or missing actions keep their slot; enlarged buttons
 cannot displace neighboring actions. Hide has no visible slot.
@@ -131,8 +140,8 @@ cannot displace neighboring actions. Hide has no visible slot.
 **Approve** records the signed-in user's ordinary ADO reviewer vote (`10`).
 Clicking it keeps the row collapsed or expanded as it was.
 One click submits the vote without a confirmation dialog or account selection.
-The app checks the captured PR, signed-in identity, iteration and source/target
-revisions before submitting once, then reads back the vote and
+The app checks the captured PR, signed-in identity, latest iteration and
+source/target revisions before submitting once, then reads back the vote and
 PR state. **Your ADO review** in expanded details shows your recorded vote and
 keeps **Open in ADO** available. ADO checks permissions; an author's vote may not
 count toward required reviewers. Your approval does not imply other required or
@@ -142,20 +151,14 @@ An enabled optional approval provider retains its separate **+1** row action;
 ordinary **Approve** remains in expanded details. Without a provider, the row's
 Review slot shows **Approve** directly. Already-approved votes display
 **Approved**, not another write action. If reviewer identity or revision cannot
-be verified, refresh before approving. Ignored, hidden and inactive PRs cannot
-be approved here.
+be verified, refresh before approving. Hidden, inactive, ignored-draft and
+no-longer-monitored PRs cannot be approved here. Monitored drafts support ordinary reviewer votes;
+approving does not publish the draft.
 
 ADO's reviewer-vote API has no atomic revision condition. The app checks both
 sides of the write and reports **Approval not confirmed** if revisions change or
 read-back fails. A vote may have been recorded in that case: refresh and inspect
 the PR before retrying. It never automatically retries or revokes the vote.
-
-In Settings, **Ignore draft PRs** excludes drafts from all attention lanes,
-title/tray/taskbar counts, notifications and automatic merge re-checks. It is
-off by default. The **Ignored drafts** filter lists them without attention
-actions; open a draft in Azure DevOps to publish it, or turn the setting off.
-Publishing restores normal classification on the next refresh. Existing Fix
-runs and their output are retained and are not cancelled by this option.
 
 **Publish** marks a draft ready for review. **Open** opens the PR in Azure
 DevOps. **PoP**, **Auto** and **Fix** are described below.
@@ -278,6 +281,7 @@ Copilot authentication, not your ADO token. Missing sign-in, model/access failur
 and ADO errors appear inline. One explanation runs at a time; **Cancel** stops it.
 Partial or failed responses are labeled and must not be treated as completed.
 Results stay in memory until the app exits; **Explain again** starts a fresh session.
+After a failure or cancellation, choose **Retry Explain** to start over.
 
 The displayed source and merge-base commits identify the code being explained.
 If the PR changes during the request, the result is marked failed. Copilot sees
@@ -287,7 +291,7 @@ text is sent to Copilot for inference. AI explanations can be wrong; verify
 important details against the code.
 
 Coverage notes report unread changes, binaries, LFS pointers and size limits.
-The prototype inventories at most 1,000 changes, permits 60 file/directory reads, and bounds
+Explain inventories at most 1,000 changes, permits 60 file/directory reads, and bounds
 text files to 80,000 characters, diffs to 24,000 characters and context windows to
 120 lines/16,000 characters. Directory listings include at most 200 names.
 If the model initially skips required diff or repository-content inspection, it

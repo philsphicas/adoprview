@@ -83,6 +83,11 @@ test('real row hit testing and action identity across refreshes', { timeout: 900
         }
         if(method==='cancelCopilot')return {...S.runs.get(p.runId),status:'cancelled',message:'Cancelled fake run; worktree retained',worktreeRetained:true};
         if(method==='restartMerge')return {requested:true,message:'Intercepted merge re-check'};
+        if(method==='explainPr')return {key:p.key,requestId:'offline-explain-'+(++window.explainSequence),
+          sequence:window.explainSequence,status:'running',message:'Reading synthetic pinned context',
+          output:'',coverage:[],revision:{iteration:4,sourceCommit:'a'.repeat(40),baseCommit:'b'.repeat(40)}};
+        if(method==='cancelExplanation')return {...S.explanations.get(p.key),sequence:++window.explainSequence,
+          status:'cancelled',message:'Explanation cancelled. Partial text is not a finished explanation.'};
         if(method==='approve'){
           const pr=structuredClone(S.snap.prs.find(x=>x.key===p.key));
           if(window.holdApproval)await new Promise(resolve=>window.completeApproval=resolve);
@@ -146,8 +151,9 @@ test('real row hit testing and action identity across refreshes', { timeout: 900
       await frame();
       await evaluate(`S.expanded.clear();S.lane=null;S.repo='';S.q='';S.scope='all';
         S.rowOrder=[];S.orderRevision=null;S.laneRetained.clear();S.runs.clear();S.busy.clear();closeRowMenu();
-        window.holdLog=false;S.settings.hidden=['sample-deploy-id:1001'];S.hideUndo=[];
+        window.holdLog=false;S.settings.hidden=['sample-deploy-id:1001'];S.settings.ignoreDrafts=false;S.hideUndo=[];
         window.confirmations=[];window.confirmResult=true;window.autoFailure=false;S.autoCompleteErrors.clear();
+        window.explainSequence=0;S.explanations.clear();
         window.holdApproval=false;window.approvalFailure=false;S.reviewVotes.clear();
         setSnapshot(structuredClone(window.baseline));${race ? 'window.raceFixture();' : ''}render();window.calls=[];`);
       await frame();
@@ -164,6 +170,63 @@ test('real row hit testing and action identity across refreshes', { timeout: 900
       const menu = await evaluate(`(()=>{const b=document.querySelector('#rowMenu button'),r=b.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
       return { ...p, x: menu.x, y: menu.y };
     };
+
+    await t.test('Explain preserves row targets, sanitizes output, discloses pinned evidence and supports cancel/retry at wide and narrow widths', async () => {
+      const key='sample-service-id:101';
+      for (const width of [1600,900]) {
+        await send('Emulation.setDeviceMetricsOverride', {width,height:1000,deviceScaleFactor:1,mobile:false});
+        await reset(true);
+        await evaluate(`S.expanded.add('${key}');renderRows();
+          window.originalFix=document.querySelector('[data-key="${key}"] .row [data-act="triage"]');`);
+        await click(await point(key,'.detail [data-act="explainPr"]')); await frame();
+        assert.deepEqual((await calls()).map(c=>c.method),['explainPr']);
+        assert.equal(await evaluate(`(()=>{
+          const button=document.querySelector('[data-key="${key}"] [data-act="explainPr"]');
+          button.click();return button.disabled;
+        })()`),true);
+        assert.equal((await calls()).length,1);
+        await evaluate(`updateExplanation({...S.explanations.get('${key}'),sequence:++window.explainSequence,
+          output:'Partial <script>window.explainInjected=true</script>',coverage:['Binary payload omitted'],
+          evidence:['after: /README.md, lines 1-12.']});`);
+        assert.equal(await evaluate(`window.originalFix===document.querySelector('[data-key="${key}"] .row [data-act="triage"]')`),true);
+        assert.equal(await evaluate('window.explainInjected===true'),false);
+        assert.equal(await evaluate(`document.querySelector('[data-key="${key}"] .explain-details').open`),false);
+        await click(await point(key,'.detail [data-act="cancelExplanation"]')); await frame();
+        const cancel=(await calls()).find(c=>c.method==='cancelExplanation');
+        assert.equal(cancel.key,key);
+        assert.equal(cancel.requestId,'offline-explain-1');
+        assert.match(await evaluate(`document.querySelector('[data-key="${key}"] [data-act="explainPr"]').textContent`),/Retry Explain/);
+        await click(await point(key,'.detail [data-act="explainPr"]')); await frame();
+        await evaluate(`window.currentExplain=S.explanations.get('${key}');
+          updateExplanation({...window.currentExplain,sequence:++window.explainSequence,status:'completed',
+            message:'Summary ready.',output:'The fixture generator is a developer utility. Its dependency changes. <img src="https://evil.invalid/image"><a href="https://evil.invalid/">link</a><button>run</button>',
+            coverage:['Binary payload omitted'],evidence:['after: /README.md, lines 1-12.']});
+          updateExplanation({...window.currentExplain,sequence:1,output:'late cancelled response'});`);
+        assert.equal(await evaluate(`(()=>{
+          const card=document.querySelector('[data-key="${key}"] .explanation');
+          return !card.querySelector('.explain-output img, .explain-output a, .explain-output button, .explain-output script')
+            && card.querySelector('.explain-output').textContent.includes('developer utility')
+            && !card.querySelector('.explain-details').open
+            && card.scrollWidth<=card.clientWidth+1;
+        })()`),true,`Sanitized brief panel fits at ${width}px`);
+        const summary=await point(key,'.explain-details summary');
+        await click(summary); await frame();
+        assert.match(await evaluate(`document.querySelector('[data-key="${key}"] .explain-revision').textContent`),/source aaaaaaaaaaaa.*merge base bbbbbbbbbbbb/);
+        assert.match(await evaluate(`document.querySelector('[data-key="${key}"] .explain-evidence').textContent`),/README.md/);
+        assert.match(await evaluate(`document.querySelector('[data-key="${key}"] .explain-coverage').textContent`),/Binary payload omitted/);
+        await evaluate(`document.querySelector('[data-key="${key}"] .explain-details summary').focus();`);
+        await send('Input.dispatchKeyEvent',{type:'keyDown',key:'Enter',code:'Enter',windowsVirtualKeyCode:13,text:'\r'});
+        await send('Input.dispatchKeyEvent',{type:'keyUp',key:'Enter',code:'Enter',windowsVirtualKeyCode:13});
+        await frame();
+        assert.equal(await evaluate(`document.querySelector('[data-key="${key}"] .explain-details').open`),false);
+        await evaluate(`updateExplanation({...S.explanations.get('${key}'),sequence:++window.explainSequence,
+          status:'failed',message:'The PR revisions changed. Retry Explain.',output:'partial response'});`);
+        assert.match(await evaluate(`document.querySelector('[data-key="${key}"] .explain-status').textContent`),/revisions changed/);
+        assert.match(await evaluate(`document.querySelector('[data-key="${key}"] [data-act="explainPr"]').textContent`),/Retry Explain/);
+        assert.deepEqual((await calls()).map(c=>c.method),['explainPr','cancelExplanation','explainPr']);
+      }
+      await send('Emulation.setDeviceMetricsOverride', {width:1600,height:1000,deviceScaleFactor:1,mobile:false});
+    });
 
     await t.test('ordinary Approve preserves collapsed/expanded rows through pending, result and refresh without dialogs or duplicate votes', async () => {
       const key='sample-service-id:101';
@@ -515,11 +578,16 @@ test('real row hit testing and action identity across refreshes', { timeout: 900
             {isMine:false,isDraft:false,humanActions:[],approval:{title:'Request approval for only this PR'},autoCompleteBy:'Offline',gates:{...base.gates,pop:{state:'ok'},reviews:{state:'ok'}}},
             {isMine:false,humanActions:['reviews','pop','autocomplete'],approval:null,reviewVote:null,repo:'other-repo',gates:{...base.gates,reviews:{state:'human'}}},
             {isMine:true,humanActions:[],approval:null,reviewVote:null,autoCompleteBy:null,gates:{...base.gates,pop:{state:'na'},reviews:{state:'ok'}}},
-            {isMine:true,humanActions:['reviews','publish','pop','autocomplete'],approval:{title:'Request approval for only this PR'},gates:{...base.gates,reviews:{state:'human'}}}
+            {isMine:true,humanActions:['reviews','publish','pop','autocomplete'],approval:{title:'Request approval for only this PR'},gates:{...base.gates,reviews:{state:'human'}}},
+            {isMine:false,approval:null,reviewVote:{...base.reviewVote,vote:0,canApprove:true}},
+            {isMine:true,approval:null,reviewVote:{...base.reviewVote,vote:10,canApprove:false,target:{...base.reviewVote.target,vote:10}}},
+            {isMine:false,approval:null,reviewVote:{...base.reviewVote,canApprove:false,detail:'Refresh before approving.'}},
+            {isMine:true,approval:null,reviewVote:{...base.reviewVote}}
           ];
           const ps=states.map((s,i)=>({...base,...s,key:'grid-'+i,id:100+i,title:'Grid fixture '+i,
             url:'https://dev.azure.com/contoso/Sample/_git/'+(s.repo||base.repo)+'/pullrequest/'+(100+i)}));
           for(const action of ['generateApproval','publish','pop','autocomplete','triage'])S.busy.add('grid-4:'+action);
+          S.busy.add('grid-8:approve');
           setSnapshot({...S.snap,prs:ps,orderRevision:(S.snap.orderRevision||0)+1});renderRows();
           document.querySelector('main').scrollLeft=9999;
         })()`);
@@ -539,6 +607,15 @@ test('real row hit testing and action identity across refreshes', { timeout: 900
           });
         }
         assert.equal(layout[3][0].button, null, 'Absent review action still needs its empty slot');
+        assert.deepEqual(await evaluate(`['grid-5','grid-6','grid-7','grid-8'].map(key=>{
+          const b=document.querySelector('[data-key="'+key+'"] .row [data-act="approve"]');
+          return {label:b.textContent.trim(),disabled:b.disabled,busy:b.getAttribute('aria-busy')};
+        })`), [
+          {label:'Approve',disabled:false,busy:null},
+          {label:'Approved',disabled:true,busy:null},
+          {label:'Approve',disabled:true,busy:null},
+          {label:'Approve',disabled:true,busy:'true'},
+        ]);
         for (const key of ['grid-0', 'grid-1', 'grid-2', 'grid-3', 'grid-4']) {
           const p = await point(key, '.row [data-act="open"]'); await click(p);
           assert.deepEqual((await calls()).filter(c => c.method === 'openUrl').at(-1), { method: 'openUrl', url: expectedUrl(p) });
@@ -646,6 +723,113 @@ test('real row hit testing and action identity across refreshes', { timeout: 900
       assert.deepEqual((await calls()).filter(c => c.method === 'cancelCopilot'), [{ method: 'cancelCopilot', key, runId: 'offline-101' }]);
       assert.match(await evaluate(`document.querySelector('#runShelf').textContent`), /worktree retained/);
       assert.ok((await calls()).every(c => !['copy', 'triage', 'openUrl'].includes(c.method)), 'Fix PR must not launch/focus/copy another UI');
+    });
+
+    await t.test('ignored drafts stay outside attention while their existing Fix controls remain accessible', async () => {
+      await reset(true);
+      const key = 'sample-service-id:101';
+      await click(await point(key, '.row [data-act="triage"]')); await frame();
+      await move(10, 10); await evaluate('document.activeElement?.blur()'); await frame();
+      await evaluate(`S.settings.ignoreDrafts=true;
+        setSnapshot({...S.snap,prs:S.snap.prs.map(p=>p.key==='${key}'?{...p,isDraft:true,isIgnoredDraft:true}:p)});
+        render();`);
+      await frame();
+      assert.equal(await evaluate(`!!document.querySelector('#rows [data-key="${key}"]')`), false);
+      assert.match(await evaluate(`document.querySelector('#runShelf').textContent`), /Ignored draft/);
+      assert.equal(await evaluate(`document.querySelector('#draftFilter').hidden`), false);
+      await click(await point(key, '.run-heading')); await frame();
+      assert.equal(await evaluate(`document.querySelector('#runShelf [data-act="cancelRun"]').hidden`), false);
+      const filterPoint = await evaluate(`(()=>{
+        const r=document.querySelector('#draftFilter').getBoundingClientRect();
+        return {x:r.x+r.width/2,y:r.y+r.height/2};
+      })()`);
+      await click(filterPoint); await frame();
+      assert.equal(await evaluate('S.scope'), 'drafts');
+      assert.equal(await evaluate('S.lane'), null);
+      assert.deepEqual(await evaluate(`[...document.querySelectorAll('#laneCounters .n')].map(e=>e.textContent)`), ['0', '0', '0', '0']);
+      assert.deepEqual(await evaluate(`[...document.querySelectorAll('#rows [data-key="${key}"] .row [data-act]')].map(e=>e.dataset.act)`), ['open']);
+      await click(await point(key, '.row [data-act="open"]')); await frame();
+      assert.deepEqual((await calls()).filter(c => c.method === 'openUrl'),
+        [{ method: 'openUrl', url: 'https://dev.azure.com/contoso/Sample/_git/sample-service/pullrequest/101' }]);
+      await click(await point(key, '.copilot-run [data-act="cancelRun"]')); await frame();
+      assert.deepEqual((await calls()).filter(c => c.method === 'cancelCopilot'), [{ method: 'cancelCopilot', key, runId: 'offline-101' }]);
+      await move(10, 10); await evaluate('document.activeElement?.blur()'); await frame();
+      await evaluate(`S.settings.ignoreDrafts=false;S.snap.prs.forEach(p=>p.isIgnoredDraft=false);render();`);
+      assert.equal(await evaluate('S.scope'), 'all');
+      assert.equal(await evaluate('document.querySelector("#draftFilter").hidden'), true);
+    });
+
+    await t.test('hostile PR description and thread comment markdown cannot run script or reach the native bridge', async () => {
+      await send('Emulation.setDeviceMetricsOverride', { width: 1600, height: 1000, deviceScaleFactor: 1, mobile: false });
+      await reset();
+      const key = 'sample-service-id:101';
+      const evil = where => {
+        const mark = `__xss.push('${where}:`;
+        const bridge = `chrome.webview.postMessage(JSON.stringify({id:1,method:'openUrl',params:{url:'https://evil.example/${where}'}}));`
+          + `MockHost.rpc('openUrl',{url:'https://evil.example/${where}'});rpc('startCopilot',{key:'${key}'});`;
+        return [
+          `**${where} bold** with a [benign ${where} link](https://example.com/${where}).`,
+          `<script>${mark}script');${bridge}</script>`,
+          `<img src="missing-${where}.png" onerror="${mark}img');${bridge}">`,
+          `<details open ontoggle="${mark}details');${bridge}"><summary>s</summary>x</details>`,
+          `<svg><animate onbegin="${mark}svg');${bridge}" attributeName="x" dur="1s"></animate></svg>`,
+          `<iframe srcdoc="<script>parent.${mark}iframe');</script>"></iframe>`,
+          `<form action="javascript:${mark}form')"><button formaction="javascript:${mark}formaction')">go</button></form>`,
+          `<a href="javascript:${mark}href')">raw js link</a>`,
+          `[markdown js link](javascript:${mark}mdlink'))`,
+          `<a href="data:text/html,<script>alert(1)</script>">data link</a>`,
+        ].join('\n\n');
+      };
+      const prepared = await evaluate(`(()=>{
+        const libs={marked:typeof window.marked?.parse,purify:typeof window.DOMPurify?.sanitize,supported:window.DOMPurify?.isSupported};
+        if(libs.marked!=='function'||libs.purify!=='function')return libs;
+        window.__xss=[];window.bridge=[];window.sanitized=[];
+        window.chrome=window.chrome||{};
+        window.chrome.webview={postMessage:m=>window.bridge.push(m),addEventListener(){}};
+        if(!window.realSanitize)window.realSanitize=DOMPurify.sanitize;
+        DOMPurify.sanitize=(html,cfg)=>{window.sanitized.push(String(html));return window.realSanitize.call(DOMPurify,html,cfg);};
+        const snap=structuredClone(S.snap),pr=snap.prs.find(p=>p.key==='${key}');
+        pr.description=${JSON.stringify(evil('desc'))};
+        pr.threads=[{id:1,status:'active',author:'Hostile Commenter',isBot:false,isAgency:false,
+          content:${JSON.stringify(evil('thread'))},replies:0,filePath:null,line:null,updated:pr.updated,url:'#'}];
+        setSnapshot({...snap,orderRevision:(S.snap.orderRevision||0)+1});
+        window.calls=[];
+        return libs;
+      })()`);
+      assert.deepEqual(prepared, { marked: 'function', purify: 'function', supported: true }, 'Vendored marked and DOMPurify must be loaded');
+      await click(await point(key, '.row .title'));
+      await frame();
+      await evaluate('new Promise(resolve=>setTimeout(resolve,750))');
+      await frame();
+      const result = await evaluate(`(()=>{
+        const row=document.querySelector('[data-key="${key}"]');
+        const bodies={desc:row.querySelector('.detail .body.md'),thread:row.querySelector('.detail .thread .md')};
+        const inspect=el=>({
+          strong:el.querySelector('strong')?.textContent,
+          literalMarkdown:el.textContent.includes('**'),
+          links:[...el.querySelectorAll('a')].map(a=>({text:a.textContent,href:a.getAttribute('href'),target:a.getAttribute('target'),rel:a.getAttribute('rel')})),
+          hazards:[...el.querySelectorAll('script,iframe,object,embed,frame,frameset,base,meta,link,style')].map(n=>n.tagName),
+          badAttrs:[...el.querySelectorAll('*')].flatMap(n=>[...n.attributes].filter(a=>/^on/i.test(a.name)||/^\\s*(javascript|data|vbscript):/i.test(a.value)||a.name==='srcdoc'||a.name==='formaction').map(a=>n.tagName+' '+a.name)),
+        });
+        return {xss:window.__xss,bridge:window.bridge,calls:window.calls,
+          sanitizedHostile:window.sanitized.filter(h=>/onerror=/.test(h)&&/<script>/.test(h)).length,
+          desc:inspect(bodies.desc),thread:inspect(bodies.thread)};
+      })()`);
+      assert.deepEqual(result.xss, [], 'No hostile script, handler or URL may execute');
+      assert.deepEqual(result.bridge, [], 'Hostile content must not post native-bridge messages');
+      assert.deepEqual(result.calls, [], 'Rendering details must not issue privileged host requests');
+      assert.ok(result.sanitizedHostile >= 2, 'Both hostile markdown bodies must reach the real DOMPurify sanitizer');
+      for (const where of ['desc', 'thread']) {
+        const r = result[where];
+        assert.equal(r.strong, `${where} bold`, `${where}: real marked formatting must still render`);
+        assert.equal(r.literalMarkdown, false, `${where}: escape-only fallback must not be used`);
+        assert.deepEqual(r.hazards, [], `${where}: hazardous elements must be removed`);
+        assert.deepEqual(r.badAttrs, [], `${where}: event handlers and script URLs must be removed`);
+        assert.deepEqual(r.links.find(l => l.text === `benign ${where} link`),
+          { text: `benign ${where} link`, href: `https://example.com/${where}`, target: '_blank', rel: 'noopener' });
+        for (const l of r.links) assert.ok(l.href === null || /^https:\/\/example\.com\//.test(l.href), `${where}: unexpected link ${l.href}`);
+      }
+      await evaluate(`DOMPurify.sanitize=window.realSanitize;delete window.chrome.webview;`);
     });
 
     await send('Browser.close', {}, false);

@@ -26,7 +26,7 @@ public sealed partial class PrService
         var vote = pr["reviewers"] is JsonArray ? ownReviewer is null ? 0 : I(ownReviewer["vote"]) : null;
         string? unavailable = !Guid.TryParse(meId, out var userId) || userId == Guid.Empty || me?.IsContainer == true
             ? "ADO did not identify an individual signed-in reviewer."
-            : !ReviewMonitored(view) ? "This PR is inactive, hidden, ignored or no longer monitored."
+            : !ReviewMonitored(view) ? "This PR is inactive, hidden or no longer monitored."
             : vote is null || pr["isDraft"] is null ? "ADO did not return the current review and draft state. Refresh before approving."
             : !Regex.IsMatch(commit, @"\A(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})\z") ||
                 !Regex.IsMatch(view.CurrentTargetCommit ?? "", @"\A(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})\z") ||
@@ -73,7 +73,7 @@ public sealed partial class PrService
     void CheckReviewMonitored(PrView scope)
     {
         if (!ReviewMonitored(scope))
-            throw new InvalidOperationException("This PR is inactive, hidden, ignored or no longer monitored. Refresh before approving.");
+            throw new InvalidOperationException("This PR is inactive, hidden or no longer monitored. Refresh before approving.");
     }
 
     async Task VerifyReviewRevisionAsync(PrView scope, ReviewVoteTarget expected)
@@ -85,8 +85,10 @@ public sealed partial class PrService
         await Task.WhenAll(prTask, iterationsTask, refsTask, targetTask);
         var pr = await prTask;
         CheckReviewIdentity(scope, pr);
-        if (S(pr["status"]) != "active" || pr["isDraft"] is null || _store.Current.IgnoreDrafts && B(pr["isDraft"]))
-            throw new InvalidOperationException("This PR is inactive or its draft state is not eligible. Refresh before approving.");
+        if (S(pr["status"]) != "active")
+            throw new InvalidOperationException("This PR is inactive. Refresh before approving.");
+        if (pr["isDraft"] is null || _store.Current.IgnoreDrafts && B(pr["isDraft"]))
+            throw new InvalidOperationException("This PR is an ignored draft or ADO did not confirm its draft state. Refresh before approving.");
         var latest = LatestReviewIteration(await iterationsTask);
         var reviewer = Arr(pr["reviewers"]).FirstOrDefault(r => S(r["id"]).Equals(expected.ReviewerId, StringComparison.OrdinalIgnoreCase));
         if (pr["reviewers"] is not JsonArray || reviewer is not null && (B(reviewer["isContainer"]) || I(reviewer["vote"]) is null) ||
@@ -97,6 +99,7 @@ public sealed partial class PrService
         if (S(pr["sourceRefName"]) != expected.SourceRef || S(pr["targetRefName"]) != expected.TargetRef ||
             I(latest?["id"]) != expected.IterationId ||
             !S(latest?["sourceRefCommit"]?["commitId"]).Equals(expected.SourceCommit, StringComparison.OrdinalIgnoreCase) ||
+            !S(pr["lastMergeSourceCommit"]?["commitId"]).Equals(expected.SourceCommit, StringComparison.OrdinalIgnoreCase) ||
             !S(head?["objectId"]).Equals(expected.SourceCommit, StringComparison.OrdinalIgnoreCase) ||
             !S(target?["objectId"]).Equals(expected.TargetCommit, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("The PR source revision, iteration or target changed. Refresh and review the current changes before approving.");
@@ -135,6 +138,9 @@ public sealed partial class PrService
                     throw new InvalidOperationException("The PR revision or review identity changed. Refresh and review before approving.");
                 if (current.Vote == 10)
                 {
+                    await VerifyReviewRevisionAsync(fresh, current);
+                    ApplyMergeCheckState(fresh, fresh: true);
+                    Classify(fresh);
                     ReplaceOne(fresh);
                     return new(true, true, "Your ADO vote is already Approved. Other review requirements may remain.", fresh);
                 }
@@ -156,6 +162,8 @@ public sealed partial class PrService
                     if (updated.ReviewVote?.Target is not { Vote: 10 } confirmed || !SameReviewRevision(confirmed, expected))
                         throw new InvalidOperationException("The PR revision or recorded vote changed during approval.");
                     await VerifyReviewRevisionAsync(updated, expected with { Vote = 10 });
+                    ApplyMergeCheckState(updated, fresh: true);
+                    Classify(updated);
                     ReplaceOne(updated);
                     return new(true, false, "Your ADO vote is Approved. This does not confirm other reviews, policy completion, merge permission or PoP.", updated);
                 }

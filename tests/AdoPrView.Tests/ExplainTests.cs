@@ -194,6 +194,10 @@ static class ExplainTests
             await Throws<System.Text.Json.JsonException>(() => Task.FromResult(ExplainModel.ReadStructuredSummary("not JSON")));
             await Throws<InvalidDataException>(() => Task.FromResult(ExplainModel.ReadStructuredSummary("""{"summary":42}""")));
             await Throws<InvalidDataException>(() => Task.FromResult(ExplainModel.ReadStructuredSummary("""{"other":"A summary."}""")));
+            await Throws<InvalidDataException>(() => Task.FromResult(ExplainModel.ReadStructuredSummary("""{"summary":"A summary.","extra":true}""")));
+            await Throws<InvalidDataException>(() => Task.FromResult(ExplainModel.ReadStructuredSummary("""{"summary":"First.","summary":"Second."}""")));
+            await Throws<InvalidDataException>(() => Task.FromResult(ExplainModel.ReadStructuredSummary(
+                JsonSerializer.Serialize(new { summary = new string('x', 481) }))));
             await Throws<InvalidDataException>(() => Task.FromResult(ExplainModel.ReadStructuredSummary("""{"summary":"One. Two. Three. Four."}""")));
             Check(ExplainModel.SummarySchema.GetProperty("properties").GetProperty("summary").GetProperty("maxLength").GetInt32() == 480,
                 "Structured response length is not bounded");

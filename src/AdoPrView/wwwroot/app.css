@@ -25,8 +25,8 @@
   --warn-bg: rgba(240, 140, 60, .13);
 
   --mono: "Cascadia Mono", "Cascadia Code", Consolas, monospace;
-  --action-cols: 80px 78px 58px 66px 30px 30px;
-  --cols: minmax(320px, 1fr) repeat(5, 90px) 76px 378px;
+  --action-cols: 90px 78px 58px 66px 30px 30px;
+  --cols: minmax(320px, 1fr) repeat(5, 90px) 76px 388px;
   color-scheme: dark;
 }
 
@@ -283,6 +283,7 @@ main { flex: 1; overflow: auto; padding: 0 20px 28px; }
 .md ul, .md ol { padding-left: 22px; }
 .md hr { border: 0; border-top: 1px solid var(--border); }
 .md.clamp { max-height: 420px; overflow: auto; }
+
 .explanation .body { padding: 14px 16px; }
 .explain-output { max-height: 520px; overflow: auto; scrollbar-gutter: stable; }
 .explain-output > * { max-width: 75ch; }

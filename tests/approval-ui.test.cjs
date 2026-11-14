@@ -40,6 +40,110 @@ function setup() {
   return { hooks, pr, window, elements, dialogs, document, context, element };
 }
 
+test('Explain is available on expanded drafts without changing fixed row actions or starting Fix', async () => {
+  const { hooks, pr, window } = setup();
+  pr.isDraft = true;
+  assert.match(hooks.renderDetail(pr), /data-act="explainPr"/);
+  assert.doesNotMatch(hooks.actionButtons(pr), /data-act="explainPr"/);
+  const calls = [];
+  let resolve;
+  window.MockHost.rpc = (method, p) => {
+    calls.push({ method, p });
+    return new Promise(r => { resolve = r; });
+  };
+  const pending = hooks.onAction('explainPr', {}, pr.key);
+  await hooks.onAction('explainPr', {}, pr.key);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, 'explainPr');
+  assert.deepEqual(Object.keys(calls[0].p), ['key']);
+  const state = { key: pr.key, requestId: 'one', sequence: 1, status: 'running', message: 'Reading', output: '', coverage: [], revision: null };
+  resolve(state);
+  await pending;
+  assert.equal(hooks.S.explanations.get(pr.key).requestId, 'one');
+  window.MockHost.rpc = async (method, p) => {
+    assert.equal(method, 'cancelExplanation');
+    assert.equal(p.key, pr.key);
+    assert.equal(p.requestId, 'one');
+    return { ...state, sequence: 2, status: 'cancelled' };
+  };
+  await hooks.onAction('cancelExplanation', { dataset: { requestId: 'one' } }, pr.key);
+  assert.equal(hooks.S.explanations.get(pr.key).status, 'cancelled');
+});
+
+test('Explain streams only into the captured panel and ignores stale request/sequence events', () => {
+  const { hooks, pr, document, element, elements } = setup();
+  const nodes = Object.fromEntries(['.explain-status', '.explain-revision', '.explain-output', '.explain-coverage', '.explain-evidence', '.explain-notices',
+    '[data-act="explainPr"]', '[data-act="cancelExplanation"]'].map(s => [s, element()]));
+  const card = { dataset: { explainKey: pr.key }, querySelector: s => nodes[s] };
+  document.querySelectorAll = s => s === '.explanation' ? [card] : [];
+  const sentinel = { innerHTML: 'neighbor stays put' };
+  elements.set('#rows', sentinel);
+  const state = { key: pr.key, requestId: 'one', sequence: 5, status: 'running', message: 'Reading',
+    output: '<script>unsafe</script>', coverage: ['Binary not inspected'], revision: { iteration: 4, sourceCommit: 'a'.repeat(40), baseCommit: 'b'.repeat(40) } };
+  hooks.updateExplanation(state);
+  assert.match(nodes['.explain-output'].innerHTML, /&lt;script&gt;/);
+  assert.equal(nodes['[data-act="cancelExplanation"]'].dataset.requestId, 'one');
+  assert.equal(nodes['[data-act="explainPr"]'].disabled, true);
+  assert.equal(sentinel.innerHTML, 'neighbor stays put');
+  hooks.updateExplanation({ ...state, requestId: 'new', sequence: 8, status: 'completed', output: 'finished' });
+  hooks.updateExplanation({ ...state, sequence: 6, output: 'late old response' });
+  assert.equal(hooks.S.explanations.get(pr.key).output, 'finished');
+  assert.equal(nodes['[data-act="cancelExplanation"]'].hidden, true);
+  assert.equal(nodes['[data-act="explainPr"]'].disabled, false);
+  assert.equal(nodes['.explain-output'].scrollTop, 0);
+  assert.match(nodes['.explain-revision'].textContent, /merge base bbbbbbbbbbbb/);
+});
+
+test('Explain refuses hidden, failed and removed pending rows without sending their content', async () => {
+  for (const reason of ['hidden', 'error', 'removed']) {
+    const { hooks, pr, window } = setup();
+    let calls = 0;
+    window.MockHost.rpc = async () => { calls++; };
+    if (reason === 'hidden') hooks.S.settings.hidden.push(pr.key);
+    if (reason === 'error') pr.error = 'Repository unavailable';
+    if (reason === 'removed') hooks.S.pendingSnapshot = { prs: [] };
+    assert.match(hooks.renderExplanation(pr.key), /data-act="explainPr" disabled/);
+    await hooks.onAction('explainPr', {}, pr.key);
+    assert.equal(calls, 0, reason);
+  }
+});
+
+test('ignored drafts disable Explain but still allow cancelling an in-flight explanation', async () => {
+  const { hooks, pr, window } = setup();
+  hooks.S.settings.ignoreDrafts = true;
+  pr.isDraft = true;
+  hooks.S.explanations.set(pr.key, { key: pr.key, requestId: 'one', sequence: 1, status: 'running',
+    message: 'Inspecting captured revision', output: 'Partial contextual summary', coverage: [], evidence: [] });
+  assert.match(hooks.renderDetail(pr), /data-explain-key="repo:123"/);
+  assert.match(hooks.renderDetail(pr), /data-act="cancelExplanation" data-request-id="one"/);
+  assert.match(hooks.renderExplanation(pr.key), /data-act="explainPr" disabled/);
+  const calls = [];
+  window.MockHost.rpc = async (method, p) => { calls.push(method); return { key: pr.key, requestId: p.requestId, sequence: 2, status: 'cancelled' }; };
+  await assert.rejects(hooks.onAction('explainPr', {}, pr.key), /Draft PRs are ignored/);
+  await hooks.onAction('cancelExplanation', { dataset: { requestId: 'one' } }, pr.key);
+  assert.deepEqual(calls, ['cancelExplanation']);
+});
+
+test('Explain sanitizes completed Markdown without remote media/links/controls and labels partial errors', () => {
+  const { hooks, pr, window, context } = setup();
+  let options;
+  context.marked = window.marked = { parse: text => text };
+  context.DOMPurify = window.DOMPurify = { sanitize: (_, config) => { options = config; return '<p>safe</p>'; } };
+  assert.equal(hooks.explanationBody({ output: '<img src="https://evil.invalid/">', status: 'completed' }), '<p>safe</p>');
+  for (const tag of ['a', 'img', 'script', 'iframe', 'input', 'button', 'style', 'svg'])
+    assert.ok(!options.ALLOWED_TAGS.includes(tag));
+  assert.equal(options.ALLOWED_ATTR.length, 0);
+  hooks.updateExplanation({ key: pr.key, requestId: 'failed', sequence: 10, status: 'failed',
+    message: 'Sign in required', output: 'partial <b>text</b>', coverage: ['No full diff inspected'], revision: null });
+  const html = hooks.renderExplanation(pr.key);
+  assert.match(html, /Sign in required/);
+  assert.match(html, /No full diff inspected/);
+  assert.match(html, /partial &lt;b&gt;text&lt;\/b&gt;/);
+  assert.match(html, /Retry Explain/);
+  assert.match(html, /<details class="explain-details">/);
+  assert.doesNotMatch(html, /<details[^>]*\bopen\b/);
+});
+
 function addReviewVote(pr) {
   pr.isActive = true;
   pr.repoId = 'repository-id';
@@ -59,38 +163,6 @@ function approvedResult(pr) {
     pr: { ...pr, reviewVote: { ...pr.reviewVote, vote: 10, canApprove: false, target: { ...pr.reviewVote.target, vote: 10 } },
       reviewers: [{ name: 'Signed-in Reviewer', id: 'signed-in-user', vote: 10 }] } };
 }
-
-test('settings expose and save independent tray notifications and chime controls in every combination', async () => {
-  for (const notifications of [false, true]) for (const sound of [false, true]) {
-    const { hooks, window, elements } = setup();
-    Object.assign(hooks.S.settings, { notifications, sound, futureSetting: 'KEEP' });
-    hooks.renderDrawer();
-    const html = elements.get('#drawerBody').innerHTML;
-    assert.match(html, /id="notifications"[^>]*\/> Tray notifications \(closing the window keeps it in the tray\)/);
-    assert.match(html, /id="sound"[^>]*\/> Play chime for new Needs Human PRs/);
-    assert.equal(/id="notifications" checked/.test(html), notifications);
-    assert.equal(/id="sound" checked/.test(html), sound);
-    for (const id of ['refreshSeconds', 'mergeCheckMinutes', 'triageInstructions', 'wslDistro', 'mergeStrategy',
-      'notifications', 'sound', 'ignoreDrafts', 'deleteSourceBranch', 'transitionWorkItems']) {
-      if (!elements.has('#' + id)) elements.set('#' + id, { value: '', checked: false });
-    }
-    elements.get('#notifications').checked = !notifications;
-    elements.get('#sound').checked = !sound;
-    let calls = 0;
-    window.MockHost.rpc = async (method, p) => {
-      assert.equal(method, 'saveSettings');
-      assert.equal(p.settings.notifications, !notifications);
-      assert.equal(p.settings.sound, !sound);
-      assert.equal(p.settings.futureSetting, 'KEEP');
-      calls++;
-      return p.settings;
-    };
-    await hooks.onDrawerAction('save', {});
-    assert.equal(calls, 1);
-    assert.equal(hooks.S.settings.notifications, !notifications);
-    assert.equal(hooks.S.settings.sound, !sound);
-  }
-});
 
 test('ordinary Approve submits once without confirmation and preserves provider and captured identity/revisions', async () => {
   const { hooks, pr, window, dialogs } = setup();
@@ -171,25 +243,36 @@ test('ordinary approval never turns malformed, wrong-identity, changed-revision 
     assert.equal(hooks.S.reviewVotes.get(pr.key).kind, 'error', kind);
     assert.equal(hooks.S.busy.size, 0, kind);
     if (kind === 'transport') assert.match(hooks.renderDetail(pr), /&lt;denied&gt;/);
+    else assert.match(hooks.S.reviewVotes.get(pr.key).message, /may have recorded your vote/);
   }
 });
 
-test('ordinary approval refuses ignored, inactive, hidden and pending changed-revision rows before submitting', async () => {
-  for (const kind of ['ignored', 'inactive', 'hidden', 'pending', 'removed']) {
+test('ordinary approval refuses inactive, hidden and pending changed-revision rows before submitting', async () => {
+  for (const kind of ['inactive', 'hidden', 'pending', 'removed', 'error']) {
     const { hooks, pr, window, dialogs } = setup();
     addReviewVote(pr);
     let calls = 0;
     window.MockHost.rpc = async () => { calls++; };
-    if (kind === 'ignored') { pr.isDraft = true; hooks.S.settings.ignoreDrafts = true; }
     if (kind === 'inactive') pr.isActive = false;
-    if (kind === 'hidden') hooks.S.settings.hidden.push(pr.key);
+    if (kind === 'hidden') hooks.S.settings.hidden.push(pr.key.toUpperCase());
     if (kind === 'pending') hooks.S.pendingSnapshot = { prs: [{ ...pr, reviewVote: { ...pr.reviewVote, target: { ...pr.reviewVote.target, iterationId: 5 } } }] };
     if (kind === 'removed') hooks.S.pendingSnapshot = { prs: [] };
-    if (kind === 'ignored') await assert.rejects(hooks.onAction('approve', {}, pr.key), /Draft PRs are ignored/);
-    else await hooks.onAction('approve', {}, pr.key);
+    if (kind === 'error') pr.error = 'Could not refresh';
+    await hooks.onAction('approve', {}, pr.key);
     assert.equal(calls, 0, kind);
     assert.equal(dialogs.length, 0, kind);
   }
+});
+
+test('ordinary approval supports monitored drafts without publishing', async () => {
+  const { hooks, pr, window } = setup();
+  addReviewVote(pr);
+  pr.isDraft = true;
+  const calls = [];
+  window.MockHost.rpc = async method => { calls.push(method); return approvedResult(pr); };
+  await hooks.onAction('approve', {}, pr.key);
+  assert.deepEqual(calls, ['approve']);
+  assert.equal(hooks.S.snap.prs[0].isDraft, true);
 });
 
 test('ordinary approval applies only confirmed captured PR and never overwrites newer queued revision or neighbor', async () => {
@@ -219,36 +302,6 @@ test('a later vote reset or revision change clears earlier ordinary-approval suc
   hooks.setSnapshot({ ...hooks.S.snap, prs: [{ ...pr, reviewVote: { ...pr.reviewVote, target: { ...pr.reviewVote.target, iterationId: 5 } } }] });
   assert.equal(hooks.S.reviewVotes.has(pr.key), false);
   assert.equal(hooks.S.snap.prs[0].reviewVote.vote, 0);
-});
-
-test('Explain is available on expanded drafts without changing fixed row actions or starting Fix', async () => {
-  const { hooks, pr, window } = setup();
-  pr.isDraft = true;
-  assert.match(hooks.renderDetail(pr), /data-act="explainPr"/);
-  assert.doesNotMatch(hooks.actionButtons(pr), /data-act="explainPr"/);
-  const calls = [];
-  let resolve;
-  window.MockHost.rpc = (method, p) => {
-    calls.push({ method, p });
-    return new Promise(r => { resolve = r; });
-  };
-  const pending = hooks.onAction('explainPr', {}, pr.key);
-  await hooks.onAction('explainPr', {}, pr.key);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].method, 'explainPr');
-  assert.deepEqual(Object.keys(calls[0].p), ['key']);
-  const state = { key: pr.key, requestId: 'one', sequence: 1, status: 'running', message: 'Reading', output: '', coverage: [], revision: null };
-  resolve(state);
-  await pending;
-  assert.equal(hooks.S.explanations.get(pr.key).requestId, 'one');
-  window.MockHost.rpc = async (method, p) => {
-    assert.equal(method, 'cancelExplanation');
-    assert.equal(p.key, pr.key);
-    assert.equal(p.requestId, 'one');
-    return { ...state, sequence: 2, status: 'cancelled' };
-  };
-  await hooks.onAction('cancelExplanation', { dataset: { requestId: 'one' } }, pr.key);
-  assert.equal(hooks.S.explanations.get(pr.key).status, 'cancelled');
 });
 
 test('ignored drafts are opt-in, excluded from attention and discoverable without write actions', () => {
@@ -294,48 +347,59 @@ test('existing Fix controls remain reachable when its PR is ignored', () => {
   assert.match(elements.get('#runShelf').innerHTML, /data-act="cancelRun"/);
 });
 
-test('Explain streams only into the captured panel and ignores stale request/sequence events', () => {
-  const { hooks, pr, document, element, elements } = setup();
-  const nodes = Object.fromEntries(['.explain-status', '.explain-revision', '.explain-output', '.explain-coverage', '.explain-evidence', '.explain-notices',
-    '[data-act="explainPr"]', '[data-act="cancelExplanation"]'].map(s => [s, element()]));
-  const card = { dataset: { explainKey: pr.key }, querySelector: s => nodes[s] };
-  document.querySelectorAll = s => s === '.explanation' ? [card] : [];
-  const sentinel = { innerHTML: 'neighbor stays put' };
-  elements.set('#rows', sentinel);
-  const state = { key: pr.key, requestId: 'one', sequence: 5, status: 'running', message: 'Reading',
-    output: '<script>unsafe</script>', coverage: ['Binary not inspected'], revision: { iteration: 4, sourceCommit: 'a'.repeat(40), baseCommit: 'b'.repeat(40) } };
-  hooks.updateExplanation(state);
-  assert.match(nodes['.explain-output'].innerHTML, /&lt;script&gt;/);
-  assert.equal(nodes['[data-act="cancelExplanation"]'].dataset.requestId, 'one');
-  assert.equal(nodes['[data-act="explainPr"]'].disabled, true);
-  assert.equal(sentinel.innerHTML, 'neighbor stays put');
-  hooks.updateExplanation({ ...state, requestId: 'new', sequence: 8, status: 'completed', output: 'finished' });
-  hooks.updateExplanation({ ...state, sequence: 6, output: 'late old response' });
-  assert.equal(hooks.S.explanations.get(pr.key).output, 'finished');
-  assert.equal(nodes['[data-act="cancelExplanation"]'].hidden, true);
-  assert.equal(nodes['[data-act="explainPr"]'].disabled, false);
-  assert.equal(nodes['.explain-output'].scrollTop, 0);
-  assert.match(nodes['.explain-revision'].textContent, /merge base bbbbbbbbbbbb/);
+test('draft filter resets when disabled and settings Save preserves the opt-in choice', async () => {
+  const { hooks, elements, window } = setup();
+  hooks.S.scope = 'drafts';
+  hooks.renderHeader();
+  assert.equal(hooks.S.scope, 'all');
+  assert.equal(elements.get('#draftFilter').hidden, true);
+  hooks.renderDrawer();
+  assert.match(elements.get('#drawerBody').innerHTML, /id="ignoreDrafts"/);
+  for (const id of ['refreshSeconds', 'mergeCheckMinutes', 'triageInstructions', 'wslDistro', 'mergeStrategy',
+    'notifications', 'ignoreDrafts', 'deleteSourceBranch', 'transitionWorkItems'])
+    elements.set('#' + id, { value: '', checked: id === 'ignoreDrafts' });
+  let calls = 0;
+  window.MockHost.rpc = async (method, p) => {
+    assert.equal(method, 'saveSettings');
+    assert.equal(p.settings.ignoreDrafts, true);
+    calls++;
+    return p.settings;
+  };
+  await hooks.onDrawerAction('save', {});
+  assert.equal(calls, 1);
+  assert.equal(hooks.S.settings.ignoreDrafts, true);
 });
 
-test('Explain sanitizes completed Markdown without remote media/links/controls and labels partial errors', () => {
-  const { hooks, pr, window, context } = setup();
-  let options;
-  context.marked = window.marked = { parse: text => text };
-  context.DOMPurify = window.DOMPurify = { sanitize: (_, config) => { options = config; return '<p>safe</p>'; } };
-  assert.equal(hooks.explanationBody({ output: '<img src="https://evil.invalid/">', status: 'completed' }), '<p>safe</p>');
-  for (const tag of ['a', 'img', 'script', 'iframe', 'input', 'button', 'style', 'svg'])
-    assert.ok(!options.ALLOWED_TAGS.includes(tag));
-  assert.equal(options.ALLOWED_ATTR.length, 0);
-  hooks.updateExplanation({ key: pr.key, requestId: 'failed', sequence: 10, status: 'failed',
-    message: 'Sign in required', output: 'partial <b>text</b>', coverage: ['No full diff inspected'], revision: null });
-  const html = hooks.renderExplanation(pr.key);
-  assert.match(html, /Sign in required/);
-  assert.match(html, /No full diff inspected/);
-  assert.match(html, /partial &lt;b&gt;text&lt;\/b&gt;/);
-  assert.match(html, /Explain again/);
-  assert.match(html, /<details class="explain-details">/);
-  assert.doesNotMatch(html, /<details[^>]*\bopen\b/);
+test('settings expose and save independent tray notifications and chime controls in every combination', async () => {
+  for (const notifications of [false, true]) for (const sound of [false, true]) {
+    const { hooks, window, elements } = setup();
+    Object.assign(hooks.S.settings, { notifications, sound, futureSetting: 'KEEP' });
+    hooks.renderDrawer();
+    const html = elements.get('#drawerBody').innerHTML;
+    assert.match(html, /id="notifications"[^>]*\/> Tray notifications \(closing the window keeps it in the tray\)/);
+    assert.match(html, /id="sound"[^>]*\/> Play chime for new Needs Human PRs/);
+    assert.equal(/id="notifications" checked/.test(html), notifications);
+    assert.equal(/id="sound" checked/.test(html), sound);
+    for (const id of ['refreshSeconds', 'mergeCheckMinutes', 'triageInstructions', 'wslDistro', 'mergeStrategy',
+      'notifications', 'sound', 'deleteSourceBranch', 'transitionWorkItems']) {
+      if (!elements.has('#' + id)) elements.set('#' + id, { value: '', checked: false });
+    }
+    elements.get('#notifications').checked = !notifications;
+    elements.get('#sound').checked = !sound;
+    let calls = 0;
+    window.MockHost.rpc = async (method, p) => {
+      assert.equal(method, 'saveSettings');
+      assert.equal(p.settings.notifications, !notifications);
+      assert.equal(p.settings.sound, !sound);
+      assert.equal(p.settings.futureSetting, 'KEEP');
+      calls++;
+      return p.settings;
+    };
+    await hooks.onDrawerAction('save', {});
+    assert.equal(calls, 1);
+    assert.equal(hooks.S.settings.notifications, !notifications);
+    assert.equal(hooks.S.settings.sound, !sound);
+  }
 });
 
 test('only rows with a provider offer expose the approval action; existing actions remain', () => {

@@ -66,7 +66,7 @@ static class ReviewerVoteTests
             Check(result.Confirmed && result.AlreadyApproved && f.Puts == 0 && !result.Pr.ReviewVote!.CanApprove, "Existing approval was written again");
             Check(result.Pr.HumanActions.Contains("reviews"), "Existing own vote incorrectly satisfied minimum reviewers");
         });
-        foreach (var change in new[] { "account", "empty-account", "identity-container", "container", "missing-vote", "changed-vote", "source", "target", "iteration", "source-ref", "target-ref", "pr-id", "repo-id", "project-id", "draft", "unknown-draft", "inactive", "pre-race", "pre-draft", "head-race" })
+        foreach (var change in new[] { "account", "empty-account", "identity-container", "container", "missing-vote", "missing-reviewers", "missing-draft", "pre-missing-draft", "changed-vote", "source", "target", "iteration", "source-ref", "target-ref", "pr-id", "repo-id", "project-id", "inactive", "pre-race", "pre-merge-source", "head-race" })
             await test("Reviewer vote preflight rejects " + change + " without a PUT", async () =>
             {
                 using var f = new Fixture();
@@ -87,7 +87,7 @@ static class ReviewerVoteTests
                 await Rejected(f);
                 Check(f.Puts == 0, "Ineligible PR reached vote API");
             });
-        foreach (var failure in new[] { "put503", "put403", "put401", "put429", "put-network", "reviewer-read", "reviewer-mismatch", "reviewer-vote", "post-read", "post-source", "post-target", "post-draft" })
+        foreach (var failure in new[] { "put503", "put403", "put401", "put429", "put-network", "reviewer-read", "reviewer-mismatch", "reviewer-vote", "post-read", "post-source", "post-target", "post-iteration", "post-inactive", "post-head", "post-hidden" })
             await test("Reviewer vote " + failure + " is explicitly unconfirmed, with no automatic PUT retry", async () =>
             {
                 using var f = new Fixture();
@@ -118,25 +118,57 @@ static class ReviewerVoteTests
             var result = await f.Service.ApproveAsync("repo-id:123", f.Expected);
             Check(result.Pr.HumanActions.Contains("reviews") && result.Pr.ReviewVote!.Vote == 10, "Author vote was counted as all reviews");
         });
-        await test("Reviewer vote remains available on an unignored draft without changing draft monitoring preference", async () =>
+        await test("Reviewer vote supports monitored drafts without changing draft state", async () =>
         {
-            using var f = new Fixture();
+            using var f = new Fixture { Draft = true };
             await f.Init();
-            f.Store.Current.IgnoreDrafts = false;
-            f.Change = "draft";
             var result = await f.Service.ApproveAsync("repo-id:123", f.Expected);
-            Check(result.Confirmed && result.Pr.IsDraft && f.Puts == 1 && !f.Store.Current.IgnoreDrafts, "Unignored draft behavior changed");
+            Check(result.Confirmed && result.Pr.IsDraft && f.Puts == 1, "Monitored draft behavior changed");
         });
+        foreach (var fromRead in new[] { 1, 2 })
+            await test($"Reviewer vote refuses a PR that becomes an ignored draft (ADO read {fromRead}) without a PUT", async () =>
+            {
+                using var f = new Fixture();
+                await f.Init();
+                f.Store.Current.IgnoreDrafts = true;
+                f.DraftFromRead = fromRead;
+                await Rejected(f);
+                Check(f.Puts == 0, "Ignored draft reached vote API");
+            });
+        await test("Reviewer vote and an enabled approval provider remain separate actions on the same PR", async () =>
+        {
+            var provider = new TestApprovalProvider();
+            using var f = new Fixture(provider);
+            TestApprovalProvider.Requests.Clear();
+            await f.Init();
+            var before = f.Service.Find("repo-id:123");
+            Check(before.Approval is not null && before.ReviewVote?.CanApprove == true, "Provider offer and direct vote did not coexist");
+            string? reply = null;
+            var bridge = new Bridge(f.Service, f.Store, text => { reply = text; return Task.CompletedTask; }, _ => { }, provider, new Ui());
+            await bridge.HandleAsync("""{"id":1,"method":"generateApproval","params":{"key":"repo-id:123"}}""");
+            Check(JsonNode.Parse(reply!)!["error"] is null && TestApprovalProvider.Requests.SequenceEqual(["repo-id:123"]) && f.Puts == 0,
+                "Provider action wrote a direct reviewer vote or was not dispatched");
+            await bridge.HandleAsync(JsonSerializer.Serialize(new { id = 2, method = "approve", @params = new { key = "repo-id:123", expected = f.Expected } }, Bridge.Json));
+            Check(JsonNode.Parse(reply!)!["result"]?["confirmed"]?.GetValue<bool>() == true && f.Puts == 1 && TestApprovalProvider.Requests.Count == 1,
+                "Direct vote was routed through the provider or did not record");
+            Check(f.Service.Find("repo-id:123").Approval is not null && f.Service.Current.ApprovalProvider?.Name == provider.Name,
+                "Direct vote made the enabled provider unavailable");
+        });
+    }
+
+    sealed class Ui : IApprovalUi
+    {
+        public Task<T> OnUiThreadAsync<T>(Func<System.Windows.Window?, T> action) => Task.FromResult(action(null));
     }
 
     sealed class Fixture : IDisposable
     {
-        public readonly SettingsStore Store = new(new AppSettings { IgnoreDrafts = true });
+        public readonly SettingsStore Store = new(new AppSettings());
         public readonly PrView Neighbor = Seed(456);
         public readonly PrService Service;
         readonly HttpClient http;
-        public int Vote, Puts, ReviewerReads, PrReads;
-        public bool AbsentSelf, IsAuthor;
+        public int Vote, Puts, ReviewerReads, PrReads, DraftFromRead;
+        public bool AbsentSelf, IsAuthor, Draft;
         public string Change = "";
         public ReviewVoteTarget Expected = null!;
         public TaskCompletionSource? Hold;
@@ -150,12 +182,12 @@ static class ReviewerVoteTests
             Url = "https://dev.azure.com/offline/project/_git/repo/pullrequest/" + id,
             ProjectId = "project-id", Repo = "repo", RepoId = "repo-id", IsActive = true, Author = new("Author", null, OtherId),
         };
-        public Fixture()
+        public Fixture(IApprovalProvider? provider = null)
         {
             Store.Current.Repos.Add(new RepoRef { Org = "offline", Project = "project", ProjectId = "project-id", Repo = "repo", RepoId = "repo-id" });
             Store.Current.Whitelist.Add("Author");
             http = new HttpClient(new FakeHandler(Respond));
-            Service = new PrService(new AdoClient(http, _ => Task.FromResult(new AuthenticationHeaderValue("Bearer", "offline"))), Store);
+            Service = new PrService(new AdoClient(http, _ => Task.FromResult(new AuthenticationHeaderValue("Bearer", "offline"))), Store, provider);
             typeof(PrService).GetField("_snapshot", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(Service,
                 new Snapshot { Prs = [Seed(123), Neighbor], OrderRevision = 19 });
         }
@@ -187,6 +219,7 @@ static class ReviewerVoteTests
                     return Json(new JsonObject(), Change switch { "put403" => HttpStatusCode.Forbidden, "put401" => HttpStatusCode.Unauthorized, "put429" => HttpStatusCode.TooManyRequests, _ => HttpStatusCode.ServiceUnavailable });
                 Vote = 10;
                 AbsentSelf = false;
+                if (Change == "post-hidden") Store.Current.Hidden.Add("repo-id:123");
                 if (Change == "put-network") throw new HttpRequestException("Offline response lost after write");
                 return Json(Reviewer());
             }
@@ -204,28 +237,29 @@ static class ReviewerVoteTests
                 PrReads++;
                 var pr = JsonNode.Parse("""{"pullRequestId":123,"status":"active","isDraft":false,"title":"Offline PR","sourceRefName":"refs/heads/fix","targetRefName":"refs/heads/main","mergeStatus":"succeeded","repository":{"id":"repo-id","name":"repo","project":{"id":"project-id"}}}""")!;
                 pr["createdBy"] = new JsonObject { ["id"] = IsAuthor ? UserId : OtherId, ["displayName"] = "Author" };
-                pr["lastMergeSourceCommit"] = new JsonObject { ["commitId"] = Source };
+                pr["lastMergeSourceCommit"] = new JsonObject { ["commitId"] = Change == "pre-merge-source" && PrReads >= 2 ? new string('f', 40) : Source };
                 pr["lastMergeTargetCommit"] = new JsonObject { ["commitId"] = Target };
                 pr["reviewers"] = AbsentSelf ? new JsonArray() : new JsonArray(Reviewer());
+                if (Change == "missing-reviewers") pr.AsObject().Remove("reviewers");
                 if (Change == "pr-id") pr["pullRequestId"] = 999;
                 if (Change == "repo-id") pr["repository"]!["id"] = "other";
                 if (Change == "project-id") pr["repository"]!["project"]!["id"] = "other";
-                if (Change == "inactive") pr["status"] = "completed";
+                if (Change == "inactive" || Change == "post-inactive" && Puts > 0) pr["status"] = "completed";
                 if (Change == "source-ref") pr["sourceRefName"] = "refs/heads/another";
                 if (Change == "target-ref") pr["targetRefName"] = "refs/heads/another";
-                if (Change == "draft" || Change == "pre-draft" && PrReads >= 2 || Change == "post-draft" && Puts > 0) pr["isDraft"] = true;
-                if (Change == "unknown-draft") pr.AsObject().Remove("isDraft");
+                pr["isDraft"] = Draft || DraftFromRead > 0 && PrReads >= DraftFromRead;
+                if (Change == "missing-draft" || Change == "pre-missing-draft" && PrReads >= 2) pr.AsObject().Remove("isDraft");
                 return Json(pr, Change == "post-read" && Puts > 0 ? HttpStatusCode.Forbidden : HttpStatusCode.OK);
             }
             if (path.EndsWith("/iterations"))
-                return Json(new JsonObject { ["value"] = new JsonArray(new JsonObject { ["id"] = Change == "iteration" ? 5 : 4, ["sourceRefCommit"] = new JsonObject { ["commitId"] = Source } }) });
+                return Json(new JsonObject { ["value"] = new JsonArray(new JsonObject { ["id"] = Change == "iteration" || Change == "post-iteration" && Puts > 0 ? 5 : 4, ["sourceRefCommit"] = new JsonObject { ["commitId"] = Source } }) });
             if (path.EndsWith("/refs"))
             {
                 var source = request.RequestUri.Query.Contains("fix");
                 return Json(new JsonObject { ["value"] = new JsonArray(new JsonObject
                 {
                     ["name"] = source ? "refs/heads/fix" : "refs/heads/main",
-                    ["objectId"] = source ? Change == "head-race" ? new string('e', 40) : Source : Target,
+                    ["objectId"] = source ? Change == "head-race" || Change == "post-head" && Puts > 0 ? new string('e', 40) : Source : Target,
                 }) });
             }
             if (path.EndsWith("/evaluations"))

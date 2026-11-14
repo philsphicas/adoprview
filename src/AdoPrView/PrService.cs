@@ -791,6 +791,7 @@ public sealed partial class PrService
     public async Task PublishAsync(string key)
     {
         var pr = Find(key);
+        await EnsureNotIgnoredDraftAsync(pr);
         await _ado.PatchAsync(PrApi(pr), new JsonObject { ["isDraft"] = false });
         await RefreshOneAsync(key);
     }

@@ -151,11 +151,12 @@ internal sealed class ExplainModel : IExplainModel
     {
         using var document = JsonDocument.Parse(content);
         if (document.RootElement.ValueKind != JsonValueKind.Object ||
+            document.RootElement.EnumerateObject().Count() != 1 ||
             !document.RootElement.TryGetProperty("summary", out var summary) ||
             summary.ValueKind != JsonValueKind.String)
             throw new InvalidDataException("Copilot did not return the required summary response.");
         var text = summary.GetString()!.Trim();
-        if (!IsBriefSummary(text))
+        if (text.Length > 480 || !IsBriefSummary(text))
             throw new InvalidDataException("Copilot did not produce the required brief contextual summary. Retry Explain.");
         return text;
     }

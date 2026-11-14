@@ -16,27 +16,48 @@ that matches the project version and is on `main` publishes a release.
 Dev flags: `--mock` (fixture data), `--screenshot out.png [--size WxH] [--eval js] [--eval-wait ms]`.
 
 The pinned `GitHub.Copilot.SDK` package downloads and verifies its matching
-Windows Copilot runtime at build time. Explain uses this native runtime;
-the existing Fix runner still uses WSL.
+Windows Copilot runtime at build time. Explain uses this native runtime.
+Release packaging includes the runtime's redistribution license and the SDK,
+DiffPlex and Microsoft.Extensions license texts under `licenses`.
+The retained upstream texts come from [DiffPlex 1.9.0](https://github.com/mmanela/diffplex/blob/3cb6415c331a0af2f2686154cb77169ef29b63ce/License.txt),
+[Copilot SDK 1.0.29](https://github.com/github/copilot-sdk/blob/v1.0.29/LICENSE),
+[Copilot CLI 1.0.107](https://github.com/github/copilot-cli/blob/v1.0.107/LICENSE.md)
+and [.NET Extensions](https://github.com/dotnet/extensions/blob/main/LICENSE).
+Review these texts when updating the dependencies or their bundled runtime.
+
+Explain's native fake-HTTP/fake-model checks and frontend checks run in the
+ordinary offline suites. The browser mock simulates Explain interactions;
+it does not contact a model or establish live ADO endpoint compatibility.
 
 ## Offline checks
 
 No live approval, PR or auth requests are made:
 
 ```powershell
-dotnet run --project tests\AdoPrView.Tests
+dotnet build tests\AdoPrView.Tests -c Release -warnaserror
+dotnet run --project tests\AdoPrView.Tests -c Release --no-build
 node --test tests\approval-ui.test.cjs
 node --test tests\row-actions.browser.test.cjs
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\install-guide.tests.ps1
 ```
 
+CI and the release package treat compiler warnings as errors (`-warnaserror`
+on the build and `dotnet publish`), so keep both projects warning-clean.
+
 The browser regression uses Node 22+ and the installed Microsoft Edge (or set
 `ROW_TEST_BROWSER` to another Chromium executable). Real mouse/keyboard input
 is used, with all URL launches and PR actions intercepted; no live PR is changed.
+It also renders hostile synthetic PR description/comment markdown through the
+vendored marked and DOMPurify and checks no script runs or native-bridge call is made.
 Native fake-HTTP/fake-clock checks cover periodic/forced restarts, target-change
 sweeps, retries, in-flight deduplication and fresh result handling. The install
 guide check parses every PowerShell block in INSTALL.md and runs its settings
 merge against a disposable folder.
+
+Draft-monitoring regressions use fake HTTP responses to cover opt-in persistence,
+skipped detail reads and writes, publication/back-to-draft transitions, and stale
+notification delivery. Frontend checks cover the Ignored drafts filter, deferred
+snapshots and retained Fix controls without starting a live Fix.
 
 The opt-in WSL preflight regression uses a disposable `/tmp` checkout and fake
 CLI executables. It checks non-login discovery, quoted paths, inherited child
@@ -49,9 +70,27 @@ dotnet run --project tests\AdoPrView.Tests
 Remove-Item Env:\ADOPRVIEW_TEST_FILTER, Env:\ADOPRVIEW_TEST_WSL_PREFLIGHT
 ```
 
+Direct reviewer approval has a focused offline native suite:
+
+```powershell
+$env:ADOPRVIEW_TEST_FILTER = 'Reviewer vote'
+dotnet run --project tests\AdoPrView.Tests -c Release
+Remove-Item Env:\ADOPRVIEW_TEST_FILTER
+```
+
+Its fake HTTP transport checks the authenticated reviewer-only payload, captured
+source/target revisions, latest iteration, monitoring eligibility, duplicate
+requests, nonretrying writes and explicit ambiguity on post-write races or
+read-back failure. The frontend and browser suites exercise one-click row and
+expanded actions, busy/error/confirmed states, provider coexistence and stable
+neighboring action targets. All approval writes in these checks are intercepted.
+
 `src\AdoPrView\wwwroot\index.html?mock=1` runs the UI in a browser against
 synthetic fixtures. The screenshots in [images](images) were captured from that
 mock UI with synthetic data.
+
+See [DESIGN.md](DESIGN.md) for the architecture, approval provider contract,
+ADO calls, classification and merge preview scheduling.
 
 The opt-in native PoP check intercepts all website requests with synthetic pages
 and uses a disposable browser profile. It exercises sign-in popup/page
@@ -64,31 +103,3 @@ $env:ADOPRVIEW_TEST_POP_WEBVIEW = '1'
 dotnet run --project tests\AdoPrView.Tests
 Remove-Item Env:\ADOPRVIEW_TEST_FILTER, Env:\ADOPRVIEW_TEST_POP_WEBVIEW
 ```
-
-## Isolated real-model Explain demonstration
-
-This opt-in check opens a native WebView2 window with the production frontend,
-bridge and Explain service. It uses real Copilot inference with synthetic ADO
-GET responses, a disposable browser profile and a separate runtime directory.
-It does not launch `MainWindow`, read/save production app settings or change
-any PR. Native Copilot sign-in/access is required, and inference consumes usage.
-The ordinary `--mock` preview only simulates Explain; it is not model integration.
-
-```powershell
-$env:ADOPRVIEW_TEST_FILTER = 'Explain live native'
-$env:ADOPRVIEW_TEST_EXPLAIN_LIVE = '1'
-$env:ADOPRVIEW_EXPLAIN_SCREENSHOT = Join-Path $env:TEMP 'adoprview-explain-demo.png'
-dotnet run --project tests\AdoPrView.Tests
-Remove-Item Env:\ADOPRVIEW_TEST_FILTER, Env:\ADOPRVIEW_TEST_EXPLAIN_LIVE, Env:\ADOPRVIEW_EXPLAIN_SCREENSHOT
-```
-
-The check writes the requested screenshot, `.narrow.png` and `.evidence.png` captures and a `.json`
-result, and removes its temporary browser/runtime directory. It verifies
-streaming through the native bridge, a 1-3 sentence/80-word summary, collapsed
-evidence, and the repository role of a developer/test utility whose nested
-`go.mod` has a one-line dependency bump. The real model must inspect README
-context, not just repeat version numbers. This does **not** establish live ADO endpoint compatibility.
-Offline Explain tests run with the normal native/frontend suites.
-
-See [DESIGN.md](DESIGN.md) for the architecture, approval provider contract,
-ADO calls, classification and merge preview scheduling.

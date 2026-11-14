@@ -40,9 +40,9 @@ static class SettingsTests
                 await test($"independent notification/sound settings round-trip through the bridge: {notifications}/{sound}", () => InDir(dir =>
                 {
                     var path = Path.Combine(dir, "settings.json");
-                    File.WriteAllText(path, """{"notifications":false,"SoUnD":false,"futureTop":"KEEP"}""");
+                    File.WriteAllText(path, JsonSerializer.Serialize(new { notifications = !sound, SoUnD = sound, futureTop = "KEEP" }));
                     var store = new SettingsStore(path);
-                    Check(!store.Current.Sound, "Explicit case-insensitive sound setting was ignored");
+                    Check(store.Current.Sound == sound, "Explicit case-insensitive sound setting was ignored");
                     using var http = new HttpClient();
                     var service = new PrService(new AdoClient(http, _ => Task.FromResult(new AuthenticationHeaderValue("Bearer", "offline"))), store);
                     string? reply = null;
@@ -57,8 +57,10 @@ static class SettingsTests
                     Check(reloaded.Current.Notifications == notifications && reloaded.Current.Sound == sound, "Independent settings did not persist");
                     Check(reloaded.Current.Extra!["futureTop"].GetString() == "KEEP", "Settings save dropped unknown fields");
                     form.Remove("sound");
+                    form["notifications"] = !notifications;
                     bridge.HandleAsync(new JsonObject { ["id"] = 2, ["method"] = "saveSettings",
                         ["params"] = new JsonObject { ["settings"] = form.DeepClone() } }.ToJsonString()).GetAwaiter().GetResult();
+                    Check(reply is not null && !reply.Contains("\"error\""), "Older settings save failed: " + reply);
                     Check(new SettingsStore(path).Current.Sound == sound, "Older settings clients reset the sound preference");
                 }));
         }

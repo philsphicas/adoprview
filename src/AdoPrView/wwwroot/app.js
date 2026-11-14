@@ -332,6 +332,12 @@ const runsForPr = key => [...S.runs.values()].reverse().filter(r => r.key === ke
 const runForPr = key => runsForPr(key).at(0);
 
 const explanationActive = r => !!r && ['preparing', 'running', 'cancelling'].includes(r.status);
+const explanationLabel = r => r?.status === 'failed' || r?.status === 'cancelled' ? 'Retry Explain' : r ? 'Explain again' : 'Explain this PR';
+function canExplain(key) {
+  const p = S.pendingSnapshot ? S.pendingSnapshot.prs.find(p => p.key === key) : findPr(key);
+  return !!p && !p.error && !p.isHidden && !hiddenSet().has(key.toLowerCase()) && !ignoredDraft(p);
+}
+
 function explanationRevision(r) {
   const v = r?.revision;
   return v ? `Iteration ${v.iteration} · source ${v.sourceCommit.slice(0, 12)} · merge base ${v.baseCommit.slice(0, 12)}` : '';
@@ -353,7 +359,7 @@ function renderExplanation(key) {
   const r = S.explanations.get(key), active = explanationActive(r);
   return `<div class="card explanation" data-explain-key="${esc(key)}">
     <h3><span class="grow">What does this PR do?</span>
-      <button class="mini" data-act="explainPr" ${active || isBusy(key, 'explainPr') || ignoredDraft(findPr(key) || {}) ? 'disabled' : ''}>${svg('spark')} ${r ? 'Explain again' : 'Explain this PR'}</button>
+      <button class="mini" data-act="explainPr" ${active || isBusy(key, 'explainPr') || !canExplain(key) ? 'disabled' : ''}>${svg('spark')} ${explanationLabel(r)}</button>
       <button class="mini" data-act="cancelExplanation" data-request-id="${esc(r?.requestId || '')}" ${active ? '' : 'hidden'} ${r?.status === 'cancelling' ? 'disabled' : ''}>${svg('x')} Cancel</button></h3>
     <div class="body">
       <p class="explain-status small${r?.status === 'failed' ? ' error' : ''}" role="status" aria-live="polite">${esc(r?.message || 'A brief summary of what changes and where it fits in this repository.')}</p>
@@ -394,8 +400,8 @@ function updateExplanation(r) {
     $('.explain-evidence', card).innerHTML = (r.evidence || []).map(x => `<p>${esc(x)}</p>`).join('');
     $('.explain-notices', card).textContent = r.coverage.length ? ` · ${r.coverage.length} notices` : '';
     const start = $('[data-act="explainPr"]', card);
-    start.disabled = active || isBusy(r.key, 'explainPr') || ignoredDraft(findPr(r.key) || {});
-    start.innerHTML = `${svg('spark')} Explain again`;
+    start.disabled = active || isBusy(r.key, 'explainPr') || !canExplain(r.key);
+    start.innerHTML = `${svg('spark')} ${explanationLabel(r)}`;
     const cancel = $('[data-act="cancelExplanation"]', card);
     cancel.hidden = !active;
     cancel.disabled = r.status === 'cancelling';
@@ -431,8 +437,8 @@ function earlierRunCards(key) {
   return earlier.map(r => renderRunCard(key, r, true)).join('');
 }
 
-// Runs stay inside their PR row. Only runs whose PR has left the loaded data entirely
-// appear here (unless hidden), and only in the unfiltered view, as collapsible entries.
+// Runs stay inside their PR row. Departed PRs and ignored drafts keep collapsible
+// run entries here (unless hidden), only in the unfiltered view.
 function renderRunShelf() {
   const shelf = $('#runShelf');
   if (!shelf) return;
@@ -572,8 +578,9 @@ function reviewVoteFor(p) {
       JSON.stringify(queued.reviewVote?.target) !== JSON.stringify(state.target)))
     return { ...state, vote: queued?.reviewVote?.vote ?? null, canApprove: false,
       detail: 'The PR revision or your review state changed. Finish this interaction, then review the refreshed PR before approving.' };
-  if (ignoredDraft(p) || p.isActive === false || p.isHidden || p.error || S.settings?.hidden?.includes(p.key))
-    return { ...state, canApprove: false, detail: 'This PR is inactive, hidden, ignored or could not be refreshed.' };
+  if (p.isActive === false || p.isHidden || p.error ||
+      hiddenSet().has(p.key.toLowerCase()))
+    return { ...state, canApprove: false, detail: 'This PR is inactive, hidden or could not be refreshed.' };
   return state;
 }
 
@@ -980,7 +987,7 @@ async function onAction(act, el, key) {
               updated.reviewVote?.vote !== 10 || target?.vote !== 10 ||
               Object.keys(expected).some(k => k !== 'vote' && expected[k] !== target[k]) ||
               !Array.isArray(updated.reviewers) || !Array.isArray(updated.humanActions) || !updated.gates)
-            throw new Error('ADO approval read-back was not confirmed. Refresh and check your recorded vote before retrying.');
+            throw new Error('ADO approval read-back was not confirmed. ADO may have recorded your vote; refresh and check the PR before retrying.');
           S.snap = { ...S.snap, prs: S.snap.prs.map(pr => pr.key === key ? updated : pr) };
           if (S.pendingSnapshot) S.pendingSnapshot = { ...S.pendingSnapshot, prs: S.pendingSnapshot.prs.map(pr =>
             pr.key === key && JSON.stringify(pr.reviewVote?.target) === JSON.stringify(expected) ? updated : pr) };
@@ -1044,15 +1051,18 @@ async function onAction(act, el, key) {
       });
       break;
     case 'explainPr':
-      if (!p || isBusy(key, act) || explanationActive(S.explanations.get(key))) return;
+      if (!canExplain(key) || isBusy(key, act) || explanationActive(S.explanations.get(key))) return;
       S.busy.add(`${key}:${act}`);
+      for (const card of document.querySelectorAll('.explanation')) {
+        if (card.dataset.explainKey === key) $('[data-act="explainPr"]', card).disabled = true;
+      }
       try { updateExplanation(await rpc('explainPr', { key })); }
       catch (e) { toast(e.message || String(e), 'error'); }
       finally {
         S.busy.delete(`${key}:${act}`);
         const state = S.explanations.get(key);
         for (const card of document.querySelectorAll('.explanation')) {
-          if (card.dataset.explainKey === key) $('[data-act="explainPr"]', card).disabled = explanationActive(state);
+          if (card.dataset.explainKey === key) $('[data-act="explainPr"]', card).disabled = explanationActive(state) || !canExplain(key);
         }
       }
       break;

@@ -83,6 +83,28 @@ static class MergeChecksTests
             catch (InvalidOperationException ex) { Check(ex.Message.Contains("ignored"), "Unexpected action error"); }
             Check(f.Patches.Count == 0, "Ignored draft write escaped");
         });
+        foreach (var action in new[] { "auto", "cancelAuto", "publish", "requeue" })
+            await test($"fresh ignored draft blocks native {action} write", async () =>
+            {
+                using var f = new Fixture();
+                f.Store.Current.IgnoreDrafts = true;
+                var p = f.Add();
+                await f.Service.RefreshAsync();
+                p.Draft = true;
+                try
+                {
+                    switch (action)
+                    {
+                        case "auto": await f.Service.SetAutoCompleteAsync(p.Key, true); break;
+                        case "cancelAuto": await f.Service.SetAutoCompleteAsync(p.Key, false); break;
+                        case "publish": await f.Service.PublishAsync(p.Key); break;
+                        case "requeue": await f.Service.RequeueAsync(p.Key, "offline-evaluation"); break;
+                    }
+                    throw new Exception("Ignored draft write accepted");
+                }
+                catch (InvalidOperationException ex) { Check(ex.Message.Contains("ignored"), "Unexpected action error"); }
+                Check(f.Patches.Count == 0, "Ignored draft write escaped");
+            });
         await test("merge cadence sends exact restart PATCH, preserves options and follows fresh results", async () =>
         {
             using var f = new Fixture();

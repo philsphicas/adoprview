@@ -279,7 +279,7 @@ public sealed class MainWindow : Window, IApprovalUi
     void OnSnapshot(Snapshot s)
     {
         _ = _bridge?.PushSnapshotAsync(s);
-        var visible = s.Prs.Where(p => !p.IsHidden && !p.IsIgnoredDraft).ToList();
+        var visible = s.Prs.Where(p => !p.IsHidden && !p.IsIgnoredDraft && !(_store.Current.IgnoreDrafts && p.IsDraft)).ToList();
         var needs = visible.Count(p => p.Lane == Lane.NeedsHuman);
         var blocked = visible.Count(p => p.Lane == Lane.Blocked);
         Title = needs > 0 ? $"ADO PR View — {needs} need human action" : "ADO PR View";
@@ -303,7 +303,8 @@ public sealed class MainWindow : Window, IApprovalUi
     {
         lock (pendingNotices)
         {
-            var pending = visible.Where(p => pendingNotices.TryGetValue(p.Key, out var lane) && lane == p.Lane).ToList();
+            var pending = visible.Where(p => !p.IsHidden && !p.IsIgnoredDraft && !(settings.IgnoreDrafts && p.IsDraft) && p.Error is null &&
+                pendingNotices.TryGetValue(p.Key, out var lane) && lane == p.Lane).ToList();
             var notices = pending.Select(p => $"{(p.Lane == Lane.NeedsHuman ? "Needs Human" : "Blocked")}: !{p.Id} {p.Title}").ToArray();
             pendingNotices.Clear();
             return (notices, settings.Sound && !headlessCapture && pending.Any(p => p.Lane == Lane.NeedsHuman));
